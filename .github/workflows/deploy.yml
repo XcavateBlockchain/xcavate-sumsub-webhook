@@ -41,6 +41,7 @@ jobs:
             TESTNET_WS_URL=${{ secrets.TESTNET_WS_URL }}
             MAINNET_WS_URL=${{ secrets.MAINNET_WS_URL }}
             FAUCET_MNEMONIC=${{ secrets.FAUCET_MNEMONIC }}
+            SUMSUB_SECRET=${{ secrets.SUMSUB_SECRET }}
             PORT=8005
             EOF
 

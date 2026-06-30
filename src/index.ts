@@ -500,10 +500,10 @@ async function processSumsubWebhook(body: SumsubPayload): Promise<void> {
       );
     }
 
-    // 3. Testnet only: 10 000 tGBP (assetId=10, decimals=6 → 10⁴ × 10⁶)
+    // 3. Testnet only: 10 000 tGBP (assetId=10, decimals=18)
     if (isTestnetFlag) {
       try {
-        const assetAmount = 10_000_000_000n; // 10000 * 10^6
+        const assetAmount = 10_000_000_000_000_000_000_000n; // 10000 * 10^18
         const hash = await transferAssetTokens(
           10,
           accountAddress,

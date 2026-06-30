@@ -2,6 +2,7 @@ import express, { Request, Response } from "express";
 import { ApiPromise, Keyring, WsProvider } from "@polkadot/api";
 import { decodeAddress } from "@polkadot/util-crypto";
 import { hexToU8a } from "@polkadot/util";
+import crypto from "crypto";
 import dotenv from "dotenv";
 import pino from "pino";
 
@@ -19,6 +20,7 @@ const logger = pino({
 const TESTNET_WS_URL = process.env.TESTNET_WS_URL || "";
 const MAINNET_WS_URL = process.env.MAINNET_WS_URL || "";
 const FAUCET_MNEMONIC = process.env.FAUCET_MNEMONIC || "";
+const SUMSUB_SECRET = process.env.SUMSUB_SECRET || "";
 const PORT = parseInt(process.env.PORT || "8005", 10);
 
 // ── Role mapping (from metadata type 71) ────────────────────────────────
@@ -31,14 +33,47 @@ const KYC_LEVEL_ROLE_MAP: Record<string, number> = {
 };
 
 // ── Sumsub webhook payload type ─────────────────────────────────────────
+//
+// Sumsub sends review results at the TOP LEVEL of the body, e.g.:
+//   {
+//     "type": "applicantReviewed",
+//     "applicantId": "...",
+//     "externalUserId": "<wallet address>",
+//     "levelName": "basic-level",
+//     "reviewStatus": "completed",
+//     "reviewResult": { "reviewAnswer": "GREEN" | "RED", ... }
+//   }
+// The legacy `event` / `data` wrapper below is kept only for backward
+// compatibility with custom callers and the local test payload.
+interface SumsubReviewResult {
+  reviewAnswer?: "GREEN" | "RED";
+  reviewRejectType?: string;
+  rejectLabels?: string[];
+  moderationComment?: string;
+  clientComment?: string;
+}
+
 interface SumsubPayload {
-  event: string;
-  data: {
-    caseId: string;
+  // Native Sumsub fields (top level)
+  type?: string;
+  applicantId?: string;
+  inspectionId?: string;
+  correlationId?: string;
+  externalUserId?: string;
+  levelName?: string;
+  reviewStatus?: string;
+  reviewResult?: SumsubReviewResult;
+  sandboxMode?: boolean;
+
+  // Legacy / custom wrapper (backward compatibility)
+  event?: string;
+  data?: {
+    caseId?: string;
     applicantId?: string;
     levelName?: string;
     reviewStatus?: string;
     status?: string;
+    externalUserId?: string;
     fields?: Array<{ name: string; value: string }>;
     attributes?: Record<string, unknown>;
     case?: Record<string, unknown>;
@@ -336,71 +371,89 @@ function waitForFinalization(extrinsic: any): Promise<void> {
 
 // ── Webhook processing ──────────────────────────────────────────────────
 
+/** Keys we accept as the user's wallet address, in priority order. */
+const WALLET_KEYS = ["walletAddress", "accountAddress", "address", "wallet"];
+
+/**
+ * Pull the user's wallet address out of whatever payload shape arrived.
+ *
+ * Recommended (native Sumsub): the address is stored in `externalUserId`,
+ * which you set when the applicant is created. We also keep the legacy
+ * fallbacks (custom `fields` array / `attributes` / `case` objects) so
+ * existing custom callers keep working.
+ */
+function extractWalletAddress(body: SumsubPayload): string | null {
+  // 1. Explicit wallet-named entry in a custom `fields` array (legacy)
+  if (body.data?.fields) {
+    for (const f of body.data.fields) {
+      if (WALLET_KEYS.includes(f.name)) return f.value;
+    }
+  }
+
+  // 2. Explicit wallet-named key in `attributes` / `case` objects (legacy)
+  for (const container of [body.data?.attributes, body.data?.case]) {
+    if (container) {
+      for (const key of WALLET_KEYS) {
+        if (container[key]) return String(container[key]);
+      }
+    }
+  }
+
+  // 3. externalUserId — the recommended place to stash the wallet address
+  const ext = body.externalUserId ?? body.data?.externalUserId;
+  if (ext) return String(ext);
+
+  return null;
+}
+
 async function processSumsubWebhook(body: SumsubPayload): Promise<void> {
-  const { event, data } = body;
+  // Normalise across native Sumsub and legacy custom shapes.
+  const eventType = body.type || body.event || "";
+  const levelName = body.levelName || body.data?.levelName || "";
+  const reviewAnswer = body.reviewResult?.reviewAnswer;
+  const caseId = body.applicantId || body.data?.applicantId || body.data?.caseId;
+
   logger.info(
-    { event, caseId: data.caseId, levelName: data.levelName },
+    { eventType, caseId, levelName, reviewAnswer },
     "Processing Sumsub webhook",
   );
 
-  const levelName = data.levelName || "";
-  const isApproved = levelName !== "none" && levelName !== "";
+  // Sumsub emits many event types, but only the final review decides a
+  // user's role and token allocation. Acknowledge everything else with 200
+  // so Sumsub stops retrying. Payloads without a `type` (legacy/custom
+  // callers and the local test) fall through to the heuristic below.
+  if (body.type && body.type !== "applicantReviewed") {
+    logger.info({ eventType }, "Non-decision event, acknowledging without action");
+    return;
+  }
+
+  // Approval:
+  //  - Native Sumsub: reviewResult.reviewAnswer === "GREEN" → approved, "RED" → rejected.
+  //  - Legacy payloads (no reviewResult): treat any concrete level as approved.
+  const isApproved =
+    reviewAnswer !== undefined
+      ? reviewAnswer === "GREEN"
+      : levelName !== "none" && levelName !== "";
+
   const roleId = KYC_LEVEL_ROLE_MAP[levelName] ?? null;
 
-  // ── Extract wallet address from various Sumsub payload shapes ──────
-  let accountAddress: string | null = null;
-
-  // Case A: fields array [{ name, value }]
-  if (data.fields) {
-    for (const f of data.fields) {
-      if (
-        f.name === "walletAddress" ||
-        f.name === "accountAddress" ||
-        f.name === "address" ||
-        f.name === "wallet"
-      ) {
-        accountAddress = f.value;
-        break;
-      }
-    }
-  }
-
-  // Case B: top-level attributes object
-  if (!accountAddress && (data as any).attributes) {
-    const attrs: Record<string, unknown> = (data as any).attributes;
-    for (const key of [
-      "walletAddress",
-      "accountAddress",
-      "address",
-      "wallet",
-    ]) {
-      if (attrs[key]) {
-        accountAddress = String(attrs[key]);
-        break;
-      }
-    }
-  }
-
-  // Case C: nested case object
-  if (!accountAddress && (data as any).case) {
-    const casedata: Record<string, unknown> = (data as any).case;
-    for (const key of [
-      "walletAddress",
-      "accountAddress",
-      "address",
-      "wallet",
-    ]) {
-      if (casedata[key]) {
-        accountAddress = String(casedata[key]);
-        break;
-      }
-    }
-  }
-
+  const accountAddress = extractWalletAddress(body);
   if (!accountAddress) {
     logger.warn(
-      { caseId: data.caseId },
+      { caseId },
       "No wallet address found in payload, skipping",
+    );
+    return;
+  }
+
+  // Validate the address up front so we never half-apply on-chain actions
+  // (e.g. assign a role but then fail every transfer) for a bad address.
+  try {
+    toAccountIdBytes(accountAddress);
+  } catch {
+    logger.warn(
+      { caseId, accountAddress },
+      "Wallet address is not a valid SS58/hex account, skipping",
     );
     return;
   }
@@ -496,33 +549,62 @@ const app = express();
 
 app.use(
   express.json({
+    // Keep the raw bytes so we can verify Sumsub's HMAC signature, which is
+    // computed over the exact request body.
     verify: (req: Request, _res, buf) => {
-      (req as any).rawBody = buf.toString();
+      (req as any).rawBody = buf;
     },
   }),
 );
 
+// ── Sumsub signature verification ──────────────────────────────────────
+// Sumsub signs each webhook with your secret key and sends:
+//   x-payload-digest:     hex HMAC of the raw body
+//   x-payload-digest-alg: the algorithm, e.g. HMAC_SHA256_HEX (default)
+const SIG_ALG_MAP: Record<string, string> = {
+  HMAC_SHA1_HEX: "sha1",
+  HMAC_SHA256_HEX: "sha256",
+  HMAC_SHA512_HEX: "sha512",
+};
+
+function verifySumsubSignature(req: Request): boolean {
+  const digest = req.headers["x-payload-digest"];
+  if (typeof digest !== "string") return false;
+
+  const algHeader = String(
+    req.headers["x-payload-digest-alg"] || "HMAC_SHA256_HEX",
+  ).toUpperCase();
+  const alg = SIG_ALG_MAP[algHeader];
+  if (!alg) {
+    logger.warn({ algHeader }, "Unsupported Sumsub signature algorithm");
+    return false;
+  }
+
+  const rawBody: Buffer = (req as any).rawBody ?? Buffer.alloc(0);
+  const computed = crypto
+    .createHmac(alg, SUMSUB_SECRET)
+    .update(rawBody)
+    .digest("hex");
+
+  const a = Buffer.from(computed, "hex");
+  const b = Buffer.from(digest, "hex");
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
 // ── Sumsub webhook endpoint ────────────────────────────────────────────
 app.post("/webhook/sumsub", async (req: Request, res: Response) => {
   try {
-    const body = req.body as SumsubPayload;
-
-    // Optional HMAC signature verification (Sumsub sends signature in
-    // X-Sumsub-Signature header).  Uncomment below and set SUMSUB_SECRET.
-    /*
-    if (process.env.SUMSUB_SECRET && req.headers["x-sumsub-signature"]) {
-      const crypto = require("crypto");
-      const hmac = crypto
-        .createHmac("sha256", process.env.SUMSUB_SECRET)
-        .update((req as any).rawBody)
-        .digest("hex");
-      if (hmac !== (req.headers["x-sumsub-signature"] as string)) {
-        logger.warn("Invalid Sumsub webhook signature");
+    // Verify the HMAC signature when a secret is configured. Without this an
+    // attacker who learns the URL could forge an "approved" event and drain
+    // the faucet, so it is strongly recommended in production.
+    if (SUMSUB_SECRET) {
+      if (!verifySumsubSignature(req)) {
+        logger.warn("Invalid or missing Sumsub webhook signature");
         return res.status(401).json({ error: "Invalid signature" });
       }
     }
-    */
 
+    const body = req.body as SumsubPayload;
     await processSumsubWebhook(body);
     res.status(200).json({ status: "ok" });
   } catch (err) {
@@ -544,6 +626,12 @@ app.get("/health", (_req: Request, res: Response) => {
 // ── Start server ──────────────────────────────────────────────────────
 const server = app.listen(PORT, () => {
   logger.info(`Sumsub webhook server listening on port ${PORT}`);
+  if (!SUMSUB_SECRET) {
+    logger.warn(
+      "SUMSUB_SECRET is not set — webhook signatures are NOT verified. " +
+        "Set it in production so forged requests cannot drain the faucet.",
+    );
+  }
 });
 
 async function gracefulShutdown() {

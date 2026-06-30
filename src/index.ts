@@ -62,7 +62,7 @@ async function getApi(): Promise<ApiPromise> {
 
   const provider = new WsProvider(wsUrl);
   apiRef = await ApiPromise.create({ provider });
-  await apiRef.isReadyOrReady;
+  await apiRef.isReady;
 
   // Detect chain to decide testnet vs mainnet behaviour
   try {
@@ -210,11 +210,14 @@ async function submitExtrinsic(
   const extrinsic = api.createType("Extrinsic", callObj, {
     version: api.extrinsicVersion,
   });
-  const signed = extrinsic.sign(signer);
+  const { genesisHash, runtimeVersion } = api;
+  const nonce = await api.rpc.system.accountNextIndex(signer.address);
+  const blockHash = await api.rpc.chain.getBlockHash();
+  const signed = extrinsic.sign(signer, { genesisHash, runtimeVersion, nonce, blockHash });
 
   logger.info(
     {
-      pallet: callObj.palletName,
+      pallet: callObj.section,
       method: callObj.method,
       hash: signed.hash.toString(),
     },
@@ -222,7 +225,7 @@ async function submitExtrinsic(
   );
 
   // Submit and wait for finalisation (with a 2-minute safety timeout)
-  const hash = await signed.send();
+  const hash = await api.rpc.author.submitExtrinsic(signed);
   await waitForFinalization(signed);
 
   return hash.toString();

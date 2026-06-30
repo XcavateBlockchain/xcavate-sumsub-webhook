@@ -1,0 +1,23 @@
+version: "3.9"
+
+services:
+  webhook:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8005:8005"
+    env_file:
+      - .env
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8005/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

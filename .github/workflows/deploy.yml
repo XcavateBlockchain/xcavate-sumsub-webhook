@@ -1,0 +1,49 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          DEPLOY_DIR: ${{ secrets.DEPLOY_DIR }}
+          DEPLOY_BRANCH: main
+          REPO_URL: https://github.com/${{ github.repository }}.git
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          port: ${{ secrets.SSH_PORT }}
+          key: ${{ secrets.SSH_KEY }}
+          envs: DEPLOY_DIR,DEPLOY_BRANCH,REPO_URL
+          script: |
+            set -e
+
+            mkdir -p "$DEPLOY_DIR"
+
+            if [ ! -d "$DEPLOY_DIR/.git" ]; then
+              git clone --branch "$DEPLOY_BRANCH" "$REPO_URL" "$DEPLOY_DIR"
+            fi
+
+            cd "$DEPLOY_DIR"
+            git fetch origin "$DEPLOY_BRANCH"
+            git checkout -f "$DEPLOY_BRANCH"
+            git reset --hard "origin/$DEPLOY_BRANCH"
+            git clean -fd
+
+            # Copy environment variables from secrets (set these in GitHub)
+            cat > .env <<EOF
+            TESTNET_WS_URL=${{ secrets.TESTNET_WS_URL }}
+            MAINNET_WS_URL=${{ secrets.MAINNET_WS_URL }}
+            FAUCET_MNEMONIC=${{ secrets.FAUCET_MNEMONIC }}
+            PORT=8005
+            EOF
+
+            docker compose down -v --remove-orphans
+            docker compose pull || true
+            docker compose up -d --build --remove-orphans

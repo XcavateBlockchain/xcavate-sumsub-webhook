@@ -27,9 +27,10 @@ const PORT = parseInt(process.env.PORT || "8005", 10);
 // 0: RegionalOperator, 1: RealEstateInvestor, 2: RealEstateDeveloper,
 // 3: Lawyer, 4: LettingAgent, 5: SpvConfirmation, 6-11: Module roles
 const KYC_LEVEL_ROLE_MAP: Record<string, number> = {
-  "basic-level": 1, // RealEstateInvestor
-  "premium-level": 2, // RealEstateDeveloper
-  "corporate-level": 2, // RealEstateDeveloper
+  "csharp-verification-investor": 1,
+  "csharp-verification-developer": 2,
+  "csharp-verification-lawyer": 3,
+  "csharp-verification-letting-agent": 4,
 };
 
 // ── Sumsub webhook payload type ─────────────────────────────────────────

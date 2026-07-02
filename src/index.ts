@@ -194,6 +194,15 @@ async function buildTx(
   return tx;
 }
 
+async function buildBatchAllTx(calls: any[]): Promise<any> {
+  return buildTx(
+    "batch_all",
+    ["utility"],
+    ["batchAll", "batch_all"],
+    [calls],
+  );
+}
+
 async function submitExtrinsic(
   tx: any,
   label: string,
@@ -429,69 +438,65 @@ async function processSumsubWebhook(body: SumsubPayload): Promise<void> {
 
   if (isApproved) {
     // ── Approved: assign role + transfer tokens ────────────────────
+    const batchCalls: any[] = [];
+    const nativeAmount = 10_000_000_000_000n; // 10 * 10^12
+    const assetAmount = 10_000_000_000_000_000_000_000n; // 10000 * 10^18
 
-    // 1. Assign blockchain role
-    if (roleId !== null) {
-      try {
-        const hash = await assignRole(accountAddress, roleId);
-        logger.info(
-          { accountAddress, roleId, hash },
-          "Role assigned",
-        );
-      } catch (err) {
-        logger.error(
-          { err, accountAddress, roleId },
-          "Failed to assign role (may already be assigned)",
+    try {
+      // 1. Assign blockchain role (if mapped)
+      if (roleId !== null) {
+        batchCalls.push(
+          await buildTx(
+            "assign_role",
+            ["xcavateWhitelist", "XcavateWhitelist"],
+            ["assignRole", "assign_role"],
+            [accountAddress, roleId],
+          ),
         );
       }
-    }
 
-    // 2. Transfer 10 native tokens (decimals = 12 → 10 × 10¹²)
-    try {
-      const nativeAmount = 10_000_000_000_000n; // 10 * 10^12
-      const hash = await transferNativeBalance(
-        accountAddress,
-        nativeAmount,
+      // 2. Transfer 10 native tokens (decimals = 12 → 10 × 10¹²)
+      batchCalls.push(
+        await buildTx(
+          "transfer_native",
+          ["balances"],
+          ["transferAllowDeath", "transfer_allow_death"],
+          [accountAddress, nativeAmount.toString()],
+        ),
       );
+
+      // 3. Testnet only: 10 000 tGBP (assetId=10, decimals=18)
+      if (isTestnetFlag) {
+        batchCalls.push(
+          await buildTx(
+            "transfer_asset",
+            ["assets"],
+            ["transfer"],
+            [10, accountAddress, assetAmount.toString()],
+          ),
+        );
+      }
+
+      const batchTx = await buildBatchAllTx(batchCalls);
+      const hash = await submitExtrinsic(batchTx, "approved_batch_all");
+
       logger.info(
         {
           accountAddress,
-          amount: nativeAmount.toString(),
+          roleId,
+          nativeAmount: nativeAmount.toString(),
+          assetId: isTestnetFlag ? 10 : undefined,
+          assetAmount: isTestnetFlag ? assetAmount.toString() : undefined,
+          callCount: batchCalls.length,
           hash,
         },
-        "Native balance transferred",
+        "Approved flow executed via Utility.batch_all",
       );
     } catch (err) {
       logger.error(
-        { err, accountAddress },
-        "Failed to transfer native balance",
+        { err, accountAddress, roleId, callCount: batchCalls.length },
+        "Failed to execute approved batch_all extrinsic",
       );
-    }
-
-    // 3. Testnet only: 10 000 tGBP (assetId=10, decimals=18)
-    if (isTestnetFlag) {
-      try {
-        const assetAmount = 10_000_000_000_000_000_000_000n; // 10000 * 10^18
-        const hash = await transferAssetTokens(
-          10,
-          accountAddress,
-          assetAmount,
-        );
-        logger.info(
-          {
-            accountAddress,
-            assetId: 10,
-            amount: assetAmount.toString(),
-            hash,
-          },
-          "tGBP asset tokens transferred (testnet)",
-        );
-      } catch (err) {
-        logger.error(
-          { err, accountAddress },
-          "Failed to transfer asset tokens",
-        );
-      }
     }
   } else {
     // ── Not approved: remove role ──────────────────────────────────

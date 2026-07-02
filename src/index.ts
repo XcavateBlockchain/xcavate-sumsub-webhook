@@ -1,7 +1,6 @@
 import express, { Request, Response } from "express";
 import { ApiPromise, Keyring, WsProvider } from "@polkadot/api";
 import { decodeAddress } from "@polkadot/util-crypto";
-import { hexToU8a } from "@polkadot/util";
 import crypto from "crypto";
 import dotenv from "dotenv";
 import pino from "pino";
@@ -47,7 +46,7 @@ const KYC_LEVEL_ROLE_MAP: Record<string, number> = {
 // The legacy `event` / `data` wrapper below is kept only for backward
 // compatibility with custom callers and the local test payload.
 interface SumsubReviewResult {
-  reviewAnswer?: "GREEN" | "RED";
+  reviewAnswer?: string;
   reviewRejectType?: string;
   rejectLabels?: string[];
   moderationComment?: string;
@@ -137,156 +136,153 @@ function getSigner() {
 /** Convert SS58 / hex address → 32-byte AccountId32 bytes */
 function toAccountIdBytes(address: string): Uint8Array {
   // decodeAddress accepts SS58 strings and hex (0x...) and returns raw 32 bytes
-  if (address.startsWith("0x")) {
-    return hexToU8a(address);
-  }
   return decodeAddress(address);
 }
 
-/** MultiAddress::Id = variant index 0 (1 byte) + AccountId32 (32 bytes) */
-function toMultiAddressId(address: string): Uint8Array {
-  const addr = toAccountIdBytes(address);
-  const result = new Uint8Array(33);
-  result[0] = 0; // MultiAddress::Id
-  result.set(addr, 1);
-  return result;
+// ── Extrinsic construction & dispatch (runtime metadata resolved) ───────
+
+function normalizeCallName(name: string): string {
+  return name.replace(/[_\-\s]/g, "").toLowerCase();
 }
 
-// ── SS58 compact encoding (used for AssetId and Balance) ────────────────
-// The two least-significant bits of the first byte encode the size:
-//   0b00 → 1 byte (value < 64)
-//   0b01 → 2 bytes (value < 16 384)
-//   0b10 → 4 bytes (value < 2^30)
-//   0b11 → 8 bytes (value < 2^62)
+function resolveTxMethod(
+  api: ApiPromise,
+  sectionCandidates: string[],
+  methodCandidates: string[],
+): {
+  sectionName: string;
+  methodName: string;
+  method: (...args: unknown[]) => any;
+} {
+  const txRoot = api.tx as unknown as Record<string, Record<string, (...args: unknown[]) => any>>;
+  const sectionSet = new Set(sectionCandidates.map(normalizeCallName));
+  const methodSet = new Set(methodCandidates.map(normalizeCallName));
 
-function encodeCompact(value: bigint): Uint8Array {
-  if (value < 64n) {
-    return new Uint8Array([Number(value)]);
+  for (const [sectionName, sectionMethods] of Object.entries(txRoot)) {
+    if (!sectionSet.has(normalizeCallName(sectionName))) continue;
+    for (const [methodName, method] of Object.entries(sectionMethods || {})) {
+      if (methodSet.has(normalizeCallName(methodName))) {
+        return { sectionName, methodName, method };
+      }
+    }
   }
-  if (value < 16_384n) {
-    const v = Number(value * 4n) | 0b01;
-    const b = new Uint8Array(2);
-    b[0] = v & 0xff;
-    b[1] = (v >> 8) & 0xff;
-    return b;
-  }
-  if (value < 4_294_967_296n) {
-    const v = Number(value * 4n) | 0b10;
-    const b = new Uint8Array(4);
-    b[0] = v & 0xff;
-    b[1] = (v >> 8) & 0xff;
-    b[2] = (v >> 16) & 0xff;
-    b[3] = (v >> 24) & 0xff;
-    return b;
-  }
-  const v = value * 4n;
-  const b = new Uint8Array(8);
-  for (let i = 0; i < 8; i++) {
-    b[i] = Number((v >> BigInt(i * 8)) & 0xffn);
-  }
-  b[0] |= 0b11;
-  return b;
+
+  throw new Error(
+    `Unable to resolve runtime call. sectionCandidates=${sectionCandidates.join("|")} methodCandidates=${methodCandidates.join("|")}`,
+  );
 }
 
-function encodeCompactU32(value: number): Uint8Array {
-  return encodeCompact(BigInt(value));
+async function buildTx(
+  label: string,
+  sectionCandidates: string[],
+  methodCandidates: string[],
+  args: unknown[],
+): Promise<any> {
+  const api = await getApi();
+  const resolved = resolveTxMethod(api, sectionCandidates, methodCandidates);
+  const tx = resolved.method(...args);
+
+  logger.info(
+    {
+      label,
+      section: resolved.sectionName,
+      method: resolved.methodName,
+    },
+    "Resolved runtime call",
+  );
+
+  return tx;
 }
 
-// ── Extrinsic construction & dispatch ───────────────────────────────────
-//
-// Pallet indices from metadata v15:
-//   Pallet 4  = Balances:   call[0] = transfer_allow_death
-//   Pallet 9  = Assets:     call[8] = transfer
-//   Pallet 20 = XcavateWhitelist:
-//                 call[2] = assign_role (AccountId32, Role)
-//                 call[3] = remove_role (AccountId32, Role)
-//                 call[4] = set_permission (AccountId32, Role, AccessPermission)
-//
-// We build raw call bytes [pallet_idx, call_idx, …arg_bytes] and feed
-// them to `registry.createType("Call", bytes)` which decodes them
-// against the live metadata — no compile-time codegen needed.
-
-/**
- * Build raw call bytes for a signed extrinsic.
- * Returns a Buffer with: [palletIdx(1), callIdx(1), ...argBytes...]
- */
-function buildCallBytes(
-  palletIdx: number,
-  callIdx: number,
-  ...argBytes: Uint8Array[]
-): Uint8Array {
-  const total = 2 + argBytes.reduce((s, b) => s + b.length, 0);
-  const out = new Uint8Array(total);
-  out[0] = palletIdx;
-  out[1] = callIdx;
-  let off = 2;
-  for (const b of argBytes) {
-    out.set(b, off);
-    off += b.length;
-  }
-  return out;
-}
-
-/**
- * Submit a signed extrinsic constructed from raw call bytes and
- * wait for finalisation.  Returns the extrinsic hash.
- */
 async function submitExtrinsic(
-  callBytes: Uint8Array,
+  tx: any,
   label: string,
 ): Promise<string> {
   const api = await getApi();
   const signer = getSigner();
 
-  // Decode the raw bytes against the live metadata so polkadot-js knows
-  // the call's section, method, and argument types.
-  const callObj = api.registry.createType("Call", callBytes);
+  return new Promise<string>(async (resolve, reject) => {
+    let settled = false;
+    let unsub: (() => void) | undefined;
 
-  // Wrap in an extrinsic and sign
-  const extrinsic = api.createType("Extrinsic", callObj, {
-    version: api.extrinsicVersion,
+    const fail = (err: Error) => {
+      if (settled) return;
+      settled = true;
+      unsub?.();
+      reject(err);
+    };
+
+    const pass = (hash: string) => {
+      if (settled) return;
+      settled = true;
+      unsub?.();
+      resolve(hash);
+    };
+
+    const timeoutId = setTimeout(() => {
+      fail(new Error(`${label}: timeout waiting for finalization`));
+    }, 120_000);
+
+    try {
+      unsub = await tx.signAndSend(signer, (result: any) => {
+        const { status, dispatchError, txHash } = result;
+
+        if (status?.isInBlock) {
+          logger.info(
+            { label, blockHash: status.asInBlock.toString() },
+            "Extrinsic included in block",
+          );
+        }
+
+        if (dispatchError) {
+          let reason = dispatchError.toString();
+          if (dispatchError.isModule) {
+            const decoded = api.registry.findMetaError(dispatchError.asModule);
+            reason = `${decoded.section}.${decoded.name}: ${decoded.docs.join(" ")}`;
+          }
+          clearTimeout(timeoutId);
+          return fail(new Error(`${label}: dispatch failed: ${reason}`));
+        }
+
+        if (status?.isFinalized) {
+          const hash = txHash?.toString?.() || tx.hash?.toString?.() || "";
+          logger.info(
+            { label, hash, blockHash: status.asFinalized.toString() },
+            "Extrinsic finalized",
+          );
+          clearTimeout(timeoutId);
+          return pass(hash);
+        }
+      });
+    } catch (err) {
+      clearTimeout(timeoutId);
+      fail(err instanceof Error ? err : new Error(String(err)));
+    }
   });
-  const { genesisHash, runtimeVersion } = api;
-  const nonce = await api.rpc.system.accountNextIndex(signer.address);
-  const blockHash = await api.rpc.chain.getBlockHash();
-  const signed = extrinsic.sign(signer, { genesisHash, runtimeVersion, nonce, blockHash });
-
-  logger.info(
-    {
-      pallet: callObj.section,
-      method: callObj.method,
-      hash: signed.hash.toString(),
-    },
-    `${label}: signed, submitting`,
-  );
-
-  // Submit and wait for finalisation (with a 2-minute safety timeout)
-  const hash = await api.rpc.author.submitExtrinsic(signed);
-  await waitForFinalization(signed);
-
-  return hash.toString();
 }
 
 // ── Role management (Pallet 20: XcavateWhitelist) ──────────────────────
 
-/** Pallet 20, Call 2: assign_role(user, role) */
+/** assign_role(user, role) resolved from runtime metadata */
 async function assignRole(account: string, roleId: number): Promise<string> {
-  const args = buildCallBytes(
-    20, 2,
-    toAccountIdBytes(account),
-    new Uint8Array([roleId]),
+  const tx = await buildTx(
+    "assign_role",
+    ["xcavateWhitelist", "XcavateWhitelist"],
+    ["assignRole", "assign_role"],
+    [account, roleId],
   );
-  return submitExtrinsic(args, "assign_role");
+  return submitExtrinsic(tx, "assign_role");
 }
 
-/** Pallet 20, Call 3: remove_role(user, role) */
+/** remove_role(user, role) resolved from runtime metadata */
 async function removeRole(account: string, roleId: number): Promise<string> {
-  const args = buildCallBytes(
-    20, 3,
-    toAccountIdBytes(account),
-    new Uint8Array([roleId]),
+  const tx = await buildTx(
+    "remove_role",
+    ["xcavateWhitelist", "XcavateWhitelist"],
+    ["removeRole", "remove_role"],
+    [account, roleId],
   );
-  return submitExtrinsic(args, "remove_role");
+  return submitExtrinsic(tx, "remove_role");
 }
 
 /**
@@ -298,76 +294,48 @@ async function setPermission(
   roleId: number,
   isCompliant: boolean,
 ): Promise<string> {
-  const args = buildCallBytes(
-    20, 4,
-    toAccountIdBytes(account),
-    new Uint8Array([roleId]),
-    new Uint8Array([isCompliant ? 1 : 0]),
+  const tx = await buildTx(
+    "set_permission",
+    ["xcavateWhitelist", "XcavateWhitelist"],
+    ["setPermission", "set_permission"],
+    [account, roleId, isCompliant ? 1 : 0],
   );
-  return submitExtrinsic(args, "set_permission");
+  return submitExtrinsic(tx, "set_permission");
 }
 
 // ── Token transfers ─────────────────────────────────────────────────────
 
 /**
- * Native balance transfer — Pallet 4, Call 0: transfer_allow_death
- * Args: MultiAddress::Id (1+32), Balance (compact u128)
+ * Native balance transfer resolved from runtime metadata.
  */
 async function transferNativeBalance(
   to: string,
   amount: bigint,
 ): Promise<string> {
-  const args = buildCallBytes(
-    4, 0,
-    toMultiAddressId(to),
-    encodeCompact(amount),
+  const tx = await buildTx(
+    "transfer_native",
+    ["balances"],
+    ["transferAllowDeath", "transfer_allow_death"],
+    [to, amount.toString()],
   );
-  return submitExtrinsic(args, "transfer_native");
+  return submitExtrinsic(tx, "transfer_native");
 }
 
 /**
- * Asset token transfer — Pallet 9, Call 8: assets.transfer
- * Args: AssetId (compact u32), MultiAddress::Id (1+32), Balance (compact u128)
+ * Asset token transfer resolved from runtime metadata.
  */
 async function transferAssetTokens(
   assetId: number,
   to: string,
   amount: bigint,
 ): Promise<string> {
-  const args = buildCallBytes(
-    9, 8,
-    encodeCompactU32(assetId),
-    toMultiAddressId(to),
-    encodeCompact(amount),
+  const tx = await buildTx(
+    "transfer_asset",
+    ["assets"],
+    ["transfer"],
+    [assetId, to, amount.toString()],
   );
-  return submitExtrinsic(args, "transfer_asset");
-}
-
-// ── Finalisation wait helper ────────────────────────────────────────────
-function waitForFinalization(extrinsic: any): Promise<void> {
-  return new Promise<void>((resolve) => {
-    const unsub = extrinsic?.on("status", async (status: any) => {
-      if (status.isInBlock) {
-        logger.info(
-          { blockHash: status.asInBlock.toString() },
-          "Extrinsic included in block",
-        );
-      }
-      if (status.isFinalized) {
-        logger.info(
-          { blockHash: status.asFinalized.toString() },
-          "Extrinsic finalized",
-        );
-        unsub?.();
-        resolve();
-      }
-    });
-
-    // Safety timeout — 2 minutes
-    setTimeout(() => {
-      resolve();
-    }, 120_000);
-  });
+  return submitExtrinsic(tx, "transfer_asset");
 }
 
 // ── Webhook processing ──────────────────────────────────────────────────

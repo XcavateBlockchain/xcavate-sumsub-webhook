@@ -38,9 +38,10 @@ jobs:
 
             # Copy environment variables from secrets (set these in GitHub)
             cat > .env <<EOF
-            TESTNET_WS_URL=${{ secrets.TESTNET_WS_URL }}
-            MAINNET_WS_URL=${{ secrets.MAINNET_WS_URL }}
-            FAUCET_MNEMONIC=${{ secrets.FAUCET_MNEMONIC }}
+            SOLANA_RPC_URL=${{ secrets.SOLANA_RPC_URL }}
+            ADMIN_PRIVATE_KEY='${{ secrets.ADMIN_PRIVATE_KEY }}'
+            REJECTED_ROLE_ACTION=${{ vars.REJECTED_ROLE_ACTION }}
+            FAUCET_SOL_AMOUNT=${{ vars.FAUCET_SOL_AMOUNT }}
             SUMSUB_SECRET=${{ secrets.SUMSUB_SECRET }}
             PORT=8005
             EOF

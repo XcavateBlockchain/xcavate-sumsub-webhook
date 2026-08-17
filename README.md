@@ -1,16 +1,25 @@
 # xcavate-sumsub-webhook
 
-Webhook service that bridges Sumsub KYC results with the Xcavate blockchain.
+Webhook service that bridges Sumsub KYC results with the **realXmarket
+`xcavate_whitelist` Solana program**.
 
-When a Sumsub applicant is **reviewed and approved** (`reviewAnswer = GREEN`), the
-webhook automatically:
+When a Sumsub applicant is **reviewed and approved** (`reviewAnswer = GREEN`),
+the service assigns the role that matches the KYC level — calling `assign_role`
+if the user doesn't hold it yet, or `set_permission(Compliant)` if a previously
+revoked assignment is still on chain.
 
-1. **Assigns a blockchain role** via the `XcavateWhitelist` pallet based on the KYC level
-2. **Transfers 10 native tokens** (12 decimals) to the user's address
-3. **Transfers 10,000 tGBP tokens** (assetId=10, 6 decimals) — testnet only
+When an applicant is **reviewed and rejected** (`reviewAnswer = RED`), the
+matching assignment is revoked (`set_permission(Revoked)`), or removed outright
+if you set `REJECTED_ROLE_ACTION=remove`.
 
-When an applicant is **reviewed and rejected** (`reviewAnswer = RED`), the previously
-assigned role is removed. All other Sumsub events are acknowledged and ignored.
+All other Sumsub events are acknowledged and ignored.
+
+| | |
+|---|---|
+| **Program** | [`2vVARM46pPD4rcHdbXHnYA4vTGN14q6skQAzsQWcHUxn`](https://explorer.solana.com/address/2vVARM46pPD4rcHdbXHnYA4vTGN14q6skQAzsQWcHUxn?cluster=devnet) |
+| **Cluster** | Devnet (set `SOLANA_RPC_URL` for anything else) |
+| **Source** | [XcavateBlockchain/realxmarket-solana](https://github.com/XcavateBlockchain/realxmarket-solana) |
+| **IDL** | [`src/idl/xcavate_whitelist.json`](src/idl/xcavate_whitelist.json) |
 
 ---
 
@@ -30,10 +39,55 @@ docker compose up --build
 curl http://localhost:8005/health
 ```
 
+```json
+{
+  "status": "ok",
+  "cluster": "devnet",
+  "programId": "2vVARM46pPD4rcHdbXHnYA4vTGN14q6skQAzsQWcHUxn",
+  "admin": "D7LHTCvNtG37QsZSphsCTkJhLhg3SfpyjqMBwtfqbvaP",
+  "adminIsRegistered": true
+}
+```
+
 The service listens on `POST /webhook/sumsub`. To receive real webhooks from
 Sumsub it must be reachable over **HTTPS** at a public URL (Sumsub rejects plain
 HTTP). Put it behind a reverse proxy / load balancer that terminates TLS, e.g.
 `https://kyc.example.com/webhook/sumsub`.
+
+---
+
+## The admin account
+
+Every role change is signed by the account in `ADMIN_PRIVATE_KEY`. That account
+must be a **registered whitelist admin** — the program checks that the
+`["admin", <signer>]` PDA exists, and rejects the instruction otherwise.
+
+```bash
+# Generate a keypair (this prints the pubkey; the file holds the secret key)
+solana-keygen new -o admin.json
+
+# Fund it on devnet — it pays fees and ~0.0014 SOL of rent per role account
+solana airdrop 2 $(solana-keygen pubkey admin.json) --url devnet
+```
+
+Then register it by calling `add_admin` **signed by the program's sudo
+authority** (stored in the `["config"]` PDA — the service logs its address at
+startup). That call lives in the program repo, not here.
+
+Put the contents of `admin.json` — a JSON array of numbers — into
+`ADMIN_PRIVATE_KEY`. A path to the file works too, which is convenient locally:
+
+```bash
+ADMIN_PRIVATE_KEY=[174,47,...]        # the raw secret key
+ADMIN_PRIVATE_KEY=/etc/xcavate/admin.json   # or a path to it
+```
+
+On startup the service checks both requirements and logs a loud error if the
+key isn't a registered admin or has a zero balance — that's much easier to spot
+at boot than in a failed webhook an hour later.
+
+> 🔑 The admin key can whitelist arbitrary wallets. Treat it as a production
+> secret; never commit it.
 
 ---
 
@@ -46,14 +100,13 @@ Follow the steps in order.
 
 - A Sumsub account with access to the **Dashboard** (Production and/or Sandbox).
 - This service deployed and reachable at a public **HTTPS** URL.
-- The faucet account mnemonic configured (`FAUCET_MNEMONIC`) with the **Admin**
-  role on the `XcavateWhitelist` pallet, and a funded balance.
+- A funded, registered admin account (see above).
 
 ### Step 1 — Decide how the user's wallet address reaches the webhook
 
 Sumsub has **no built-in "wallet address" field**. The service needs to know
-which on-chain account to whitelist and fund, so you must supply it yourself.
-The recommended way is to put the wallet address in Sumsub's **`externalUserId`**,
+which Solana account to whitelist, so you must supply it yourself. The
+recommended way is to put the wallet address in Sumsub's **`externalUserId`**,
 which is echoed back in every webhook.
 
 You set `externalUserId` when you start a verification. With the WebSDK you do
@@ -63,7 +116,7 @@ this on your backend when generating the applicant access token:
 # userId becomes the applicant's externalUserId
 POST https://api.sumsub.com/resources/accessTokens
      ?userId=<USER_WALLET_ADDRESS>
-     &levelName=basic-level
+     &levelName=csharp-verification-investor
      &ttlInSecs=600
 ```
 
@@ -76,21 +129,22 @@ The service resolves the destination account in this priority order:
 2. A `walletAddress`-style key inside an `attributes` or `case` object
 3. **`externalUserId`** ← recommended for native Sumsub webhooks
 
-If none of these contain a valid SS58/hex address, the webhook is acknowledged
+If none of these contain a valid Solana public key, the webhook is acknowledged
 (HTTP 200) but **no on-chain action is taken** — check the logs for
-`No wallet address found` or `not a valid SS58/hex account`.
+`No wallet address found` or `not a valid Solana public key`.
 
 ### Step 2 — Create the verification levels
 
 The role a user receives is decided by the Sumsub **level name**. Create your
 levels (Dashboard → **Dev space → Levels**) so their names match the mapping
-below — otherwise the user is still funded on approval but receives **no role**.
+below — otherwise the review is acknowledged but **no role is assigned**.
 
-| Sumsub `levelName` | Role assigned        |
-|--------------------|----------------------|
-| `basic-level`      | RealEstateInvestor (1) |
-| `premium-level`    | RealEstateDeveloper (2) |
-| `corporate-level`  | RealEstateDeveloper (2) |
+| Sumsub `levelName` | Role assigned |
+|---|---|
+| `csharp-verification-investor` | `RealEstateInvestor` (1) |
+| `csharp-verification-developer` | `RealEstateDeveloper` (2) |
+| `csharp-verification-lawyer` | `Lawyer` (3) |
+| `csharp-verification-letting-agent` | `LettingAgent` (4) |
 
 If you prefer different level names, edit `KYC_LEVEL_ROLE_MAP` in
 [`src/index.ts`](src/index.ts) to match.
@@ -102,12 +156,12 @@ and fill in the form:
 
 | Field | What to enter |
 |---|---|
-| **Name** | Any label, e.g. `Xcavate faucet` |
+| **Name** | Any label, e.g. `Xcavate whitelist` |
 | **Webhook receiver type** | `HTTP address` |
 | **Target** (URL) | `https://YOUR_HOST/webhook/sumsub` — must be HTTPS (TLS 1.2+) |
 | **Webhook types** | Select **`applicantReviewed`** (required). You may also add `applicantPending`, `applicantOnHold`, etc. — the service safely ignores them. |
-| **Applicant types** | `Individual` (add `Company` if you onboard companies via `corporate-level`) |
-| **Secret key** | Click generate (or paste your own) and **copy it** — you'll need it in Step 5 |
+| **Applicant types** | `Individual` (add `Company` if you onboard companies) |
+| **Secret key** | Click generate (or paste your own) and **copy it** — you'll need it in Step 4 |
 | **Signature algorithm** | `SHA256` (default). `SHA512` also works — the service auto-detects from the header. |
 | **HTTP Headers** | _(optional)_ leave empty |
 | **Resend failed webhooks** | Leave **enabled** so transient failures are retried |
@@ -115,8 +169,8 @@ and fill in the form:
 
 Click **Save**.
 
-> ⚠️ Only the **`applicantReviewed`** event triggers role assignment and token
-> transfers. If you forget to subscribe to it, nothing will happen on approval.
+> ⚠️ Only the **`applicantReviewed`** event triggers a role change. If you forget
+> to subscribe to it, nothing will happen on approval.
 
 ### Step 4 — Configure the signing secret
 
@@ -134,8 +188,8 @@ SUMSUB_SECRET=<the secret key you copied in Step 3>
 
 > 🔒 **Strongly recommended in production.** Without `SUMSUB_SECRET` the service
 > logs a startup warning and accepts unsigned requests — anyone who learns the
-> URL could forge an `applicantReviewed / GREEN` event and drain the faucet.
-> When set, requests with a missing or invalid signature get `401`.
+> URL could forge an `applicantReviewed / GREEN` event and whitelist a wallet of
+> their choosing. When set, requests with a missing or invalid signature get `401`.
 
 ### Step 5 — Test it
 
@@ -143,8 +197,9 @@ SUMSUB_SECRET=<the secret key you copied in Step 3>
    should return `200`. (Sumsub considers no response within 5s a timeout and
    retries up to 4 times.)
 2. Run a real verification in **Sandbox** mode with `externalUserId` set to a
-   test wallet, approve the applicant, and confirm in the logs that the role and
-   transfers were submitted on-chain.
+   test wallet, approve the applicant, and confirm in the logs that the role was
+   assigned. Every successful call logs a `signature` you can open in the
+   [explorer](https://explorer.solana.com/?cluster=devnet).
 3. The `sandboxMode` flag in the payload tells you whether an event came from
    Sandbox or Production.
 
@@ -166,8 +221,8 @@ X-Payload-Digest-Alg: HMAC_SHA256_HEX
   "applicantId": "5cb56e8e0a975a35f333cb83",
   "inspectionId": "5cb56e8e0a975a35f333cb84",
   "correlationId": "req-…",
-  "externalUserId": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
-  "levelName": "basic-level",
+  "externalUserId": "3oX5ttHJvcqJDwbYh96tkShaa4bnWMM3JHc2N4kocSNY",
+  "levelName": "csharp-verification-investor",
   "reviewStatus": "completed",
   "reviewResult": {
     "reviewAnswer": "GREEN"
@@ -182,9 +237,9 @@ Fields the service reads:
 | Field | Used for |
 |---|---|
 | `type` | Only `applicantReviewed` triggers action; others are acknowledged and skipped |
-| `reviewResult.reviewAnswer` | `GREEN` → approve (assign role + transfer), `RED` → remove role |
-| `levelName` | Maps to the blockchain role (see table above) |
-| `externalUserId` | Destination wallet address (see Step 1 for alternatives) |
+| `reviewResult.reviewAnswer` | `GREEN` → approve, `RED` → revoke |
+| `levelName` | Maps to the role (see table above) |
+| `externalUserId` | The user's Solana wallet address (see Step 1 for alternatives) |
 
 > **Backward compatibility:** payloads that use the older custom shape
 > (`{ "event": ..., "data": { "levelName": ..., "fields": [...] } }`) are still
@@ -193,41 +248,67 @@ Fields the service reads:
 
 ---
 
-## KYC Level → Role Mapping
+## What happens on chain
 
-| KYC Level | Role | Pallet Call |
+Each `(user, role)` assignment is its own account at the PDA
+`["role", user, role_index]`, owned by the whitelist program. The service reads
+that account first and picks the instruction that actually applies, so redeliveries
+and re-verifications are safe:
+
+| Review | On-chain state | Instruction sent |
 |---|---|---|
-| `basic-level` | RealEstateInvestor (1) | `xcavateWhitelist.assign_role` |
-| `premium-level` | RealEstateDeveloper (2) | `xcavateWhitelist.assign_role` |
-| `corporate-level` | RealEstateDeveloper (2) | `xcavateWhitelist.assign_role` |
-| rejected (`RED`) | — | `xcavateWhitelist.remove_role` |
+| `GREEN` | role not assigned | `assign_role(role)` — creates the account as `Compliant` |
+| `GREEN` | assigned, `Revoked` | `set_permission(role, Compliant)` |
+| `GREEN` | assigned, `Compliant` | *nothing* — already correct |
+| `RED` | assigned | `set_permission(role, Revoked)`, or `remove_role(role)` when `REJECTED_ROLE_ACTION=remove` |
+| `RED` | not assigned | *nothing* |
 
-## Blockchain Call Reference
+Notes:
 
-All calls use raw metadata lookups at runtime — no compile-time codegen needed.
+- `assign_role` uses Anchor's `init`, so it **fails if the role is already
+  assigned** — hence the read-before-write above.
+- `remove_role` refunds the account's rent to whoever paid it at assignment, so
+  the service reads `rent_payer` off the account and passes it back.
+- Everything the service sends goes out as a **single transaction**, which
+  Solana executes atomically: all of it lands, or none of it does.
+- The client is driven by [the IDL](src/idl/xcavate_whitelist.json): program id,
+  discriminators, account ordering and signer/writable flags all come from that
+  file. After a program upgrade, drop in the regenerated IDL.
 
-| Action | Pallet | Call Index | Args |
-|---|---|---|---|
-| Assign role | 20 (XcavateWhitelist) | 2 | AccountId32, Role enum |
-| Remove role | 20 (XcavateWhitelist) | 3 | AccountId32, Role enum |
-| Native transfer | 4 (Balances) | 0 | MultiAddress, Balance (u128) |
-| Asset transfer | 9 (Assets) | 8 | AssetId (u32), MultiAddress, Balance (u128) |
+### Roles
+
+Indices are fixed by the program (`Role::seed_byte()`) and must not be reordered:
+
+| Index | Role |
+|---|---|
+| 0 | `RegionalOperator` |
+| 1 | `RealEstateInvestor` |
+| 2 | `RealEstateDeveloper` |
+| 3 | `Lawyer` |
+| 4 | `LettingAgent` |
+| 5 | `SpvConfirmation` |
 
 ---
 
 ## Environment Variables
 
 ```bash
-# Blockchain endpoint — at least one must be set.
-# If both are set, the testnet endpoint takes precedence and tGBP is also sent.
-TESTNET_WS_URL=wss://xcavate-solochain.api.onfinality.io/public-ws
-MAINNET_WS_URL=wss://...
+# Solana RPC endpoint (defaults to Devnet when unset)
+SOLANA_RPC_URL=https://api.devnet.solana.com
 
-# Faucet account — must have the Admin role on XcavateWhitelist and be funded
-FAUCET_MNEMONIC="word1 word2 ..."
+# Whitelist admin secret key as a JSON array of numbers (solana-keygen format),
+# or a path to such a file. Must be a registered admin and hold SOL.
+ADMIN_PRIVATE_KEY=[12,34,...]
 
-# Sumsub webhook secret key (from the Webhook manager). When set, every request
-# is signature-verified via the X-Payload-Digest header. Strongly recommended.
+# What to do when a user fails KYC and already holds the role:
+#   revoke (default) — keep the role, set its permission to Revoked
+#   remove           — close the role account entirely
+REJECTED_ROLE_ACTION=revoke
+
+# Optional SOL drip to newly approved users, in SOL. 0/unset disables it.
+FAUCET_SOL_AMOUNT=0
+
+# Sumsub webhook secret key. When set, every webhook is signature-verified.
 SUMSUB_SECRET=your-webhook-secret
 
 # Server port (default 8005)
@@ -240,48 +321,13 @@ PORT=8005
 
 The included workflow ([`.github/workflows/deploy.yml`](.github/workflows/deploy.yml))
 SSHes into your server, pulls `main`, writes `.env` from repository secrets, and
-restarts the container. Add these **GitHub repository secrets**:
-`SSH_HOST`, `SSH_USER`, `SSH_PORT`, `SSH_KEY`, `DEPLOY_DIR`, `TESTNET_WS_URL`,
-`MAINNET_WS_URL`, `FAUCET_MNEMONIC`, and **`SUMSUB_SECRET`**.
+restarts the container.
 
-> The current workflow writes `TESTNET_WS_URL`, `MAINNET_WS_URL`, `FAUCET_MNEMONIC`
-> and `PORT` into `.env`. Add a `SUMSUB_SECRET=${{ secrets.SUMSUB_SECRET }}` line
-> to the generated `.env` block so signature verification is enabled in production.
+Add these **repository secrets**: `SSH_HOST`, `SSH_USER`, `SSH_PORT`, `SSH_KEY`,
+`DEPLOY_DIR`, `SOLANA_RPC_URL`, `ADMIN_PRIVATE_KEY`, `SUMSUB_SECRET`.
 
-```yaml
-name: Deploy
-
-on:
-  push:
-    branches: [main]
-  workflow_dispatch:
-
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Deploy via SSH
-        uses: appleboy/ssh-action@v1.0.3
-        env:
-          DEPLOY_DIR: ${{ secrets.DEPLOY_DIR }}
-          REPO_URL: https://github.com/${{ github.repository }}.git
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          port: ${{ secrets.SSH_PORT }}
-          key: ${{ secrets.SSH_KEY }}
-          envs: DEPLOY_DIR,REPO_URL
-          script: |
-            set -e
-            mkdir -p "$DEPLOY_DIR"
-            cd "$DEPLOY_DIR"
-            git fetch origin main
-            git reset --hard origin/main
-            git clean -fd
-            docker compose down -v --remove-orphans
-            docker compose pull
-            docker compose up -d --remove-orphans
-```
+Optionally add these **repository variables**: `REJECTED_ROLE_ACTION`,
+`FAUCET_SOL_AMOUNT`. Leaving them unset keeps the defaults (`revoke`, no drip).
 
 ---
 
@@ -293,7 +339,7 @@ npm run dev
 
 # Send a test webhook in Sumsub's native shape.
 # If SUMSUB_SECRET is set, compute and attach the X-Payload-Digest header:
-BODY='{"type":"applicantReviewed","applicantId":"test","levelName":"basic-level","externalUserId":"5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY","reviewStatus":"completed","reviewResult":{"reviewAnswer":"GREEN"}}'
+BODY='{"type":"applicantReviewed","applicantId":"test","levelName":"csharp-verification-investor","externalUserId":"3oX5ttHJvcqJDwbYh96tkShaa4bnWMM3JHc2N4kocSNY","reviewStatus":"completed","reviewResult":{"reviewAnswer":"GREEN"}}'
 SIG=$(node -e 'const c=require("crypto");process.stdout.write(c.createHmac("sha256",process.env.SUMSUB_SECRET).update(process.argv[1]).digest("hex"))' "$BODY")
 
 curl -X POST http://localhost:8005/webhook/sumsub \
@@ -305,6 +351,13 @@ curl -X POST http://localhost:8005/webhook/sumsub \
 # Without SUMSUB_SECRET set, you can omit the signature headers entirely.
 ```
 
+To inspect what's already on chain:
+
+```bash
+solana account <ROLE_ACCOUNT_PDA> --url devnet
+solana program show 2vVARM46pPD4rcHdbXHnYA4vTGN14q6skQAzsQWcHUxn --url devnet
+```
+
 ---
 
 ## Troubleshooting
@@ -313,7 +366,11 @@ curl -X POST http://localhost:8005/webhook/sumsub \
 |---|---|
 | Webhook returns `401` | `SUMSUB_SECRET` doesn't match the Webhook manager's secret key, or the `X-Payload-Digest-Alg` isn't one of SHA1/SHA256/SHA512 hex |
 | `200` but `No wallet address found` in logs | `externalUserId` wasn't set when the applicant was created (see Step 1) |
-| `200` but `not a valid SS58/hex account` | `externalUserId` holds something that isn't an address |
-| Approved user gets tokens but no role | The Sumsub `levelName` isn't in `KYC_LEVEL_ROLE_MAP` (see Step 2) |
+| `200` but `not a valid Solana public key` | `externalUserId` holds something that isn't a base58 Solana address (an address from another chain, an email, …) |
+| Approved user gets no role | The Sumsub `levelName` isn't in `KYC_LEVEL_ROLE_MAP` (see Step 2) |
+| `ADMIN_PRIVATE_KEY is NOT a registered whitelist admin` at startup | The key's address has no `["admin", …]` PDA — register it with `add_admin` from the sudo authority |
+| `AnchorError … ConstraintSeeds` / `AccountNotInitialized` | The admin isn't registered, or `SOLANA_RPC_URL` points at a cluster where the program isn't deployed |
+| `Attempt to debit an account but found no record of a prior credit` | The admin account has no SOL |
+| `PermissionAlreadySet` (6001) | The permission is already at the requested value — harmless, and normally avoided by the read-before-write |
+| `WrongRentPayer` (6005) | `remove_role` was sent with a `rent_payer` other than the one stored on the role account |
 | Nothing happens on approval | The webhook isn't subscribed to `applicantReviewed`, or the target URL isn't reachable over HTTPS |
-| `No blockchain endpoint configured` | Neither `TESTNET_WS_URL` nor `MAINNET_WS_URL` is set |

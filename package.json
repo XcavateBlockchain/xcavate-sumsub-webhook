@@ -1,7 +1,7 @@
 {
   "name": "xcavate-sumsub-webhook",
   "version": "1.0.0",
-  "description": "Webhook service bridging Sumsub KYC with Xcavate blockchain roles & token allocations",
+  "description": "Webhook service bridging Sumsub KYC with realXmarket Solana whitelist roles",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
@@ -9,7 +9,7 @@
     "dev": "tsx src/index.ts"
   },
   "dependencies": {
-    "@polkadot/api": "^16.1.1",
+    "@solana/web3.js": "^1.98.4",
     "dotenv": "^16.4.7",
     "express": "^5.0.1",
     "pino": "^9.6.0"

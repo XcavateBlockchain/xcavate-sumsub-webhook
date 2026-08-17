@@ -17,7 +17,8 @@ All other Sumsub events are acknowledged and ignored.
 | | |
 |---|---|
 | **Program** | [`2vVARM46pPD4rcHdbXHnYA4vTGN14q6skQAzsQWcHUxn`](https://explorer.solana.com/address/2vVARM46pPD4rcHdbXHnYA4vTGN14q6skQAzsQWcHUxn?cluster=devnet) |
-| **Cluster** | Devnet (set `SOLANA_RPC_URL` for anything else) |
+| **Cluster** | Devnet (set `SOLANA_CLUSTER=mainnet-beta` for anything else) |
+| **RPC** | Alchemy — `ALCHEMY_API_KEY` + `SOLANA_CLUSTER` (override with `SOLANA_RPC_URL`) |
 | **Source** | [XcavateBlockchain/realxmarket-solana](https://github.com/XcavateBlockchain/realxmarket-solana) |
 | **IDL** | [`src/idl/xcavate_whitelist.json`](src/idl/xcavate_whitelist.json) |
 
@@ -293,8 +294,16 @@ Indices are fixed by the program (`Role::seed_byte()`) and must not be reordered
 ## Environment Variables
 
 ```bash
-# Solana RPC endpoint (defaults to Devnet when unset)
-SOLANA_RPC_URL=https://api.devnet.solana.com
+# Alchemy API key — the RPC endpoint is built from it and SOLANA_CLUSTER,
+# e.g. https://solana-devnet.g.alchemy.com/v2/<key>
+ALCHEMY_API_KEY=your-alchemy-key
+
+# Cluster to talk to: devnet (default) or mainnet-beta
+SOLANA_CLUSTER=devnet
+
+# Optional full RPC URL. Overrides ALCHEMY_API_KEY — set it only to bypass
+# Alchemy (self-hosted node, another provider).
+SOLANA_RPC_URL=
 
 # Whitelist admin secret key as a JSON array of numbers (solana-keygen format),
 # or a path to such a file. Must be a registered admin and hold SOL.
@@ -324,10 +333,13 @@ SSHes into your server, pulls `main`, writes `.env` from repository secrets, and
 restarts the container.
 
 Add these **repository secrets**: `SSH_HOST`, `SSH_USER`, `SSH_PORT`, `SSH_KEY`,
-`DEPLOY_DIR`, `SOLANA_RPC_URL`, `ADMIN_PRIVATE_KEY`, `SUMSUB_SECRET`.
+`DEPLOY_DIR`, `ALCHEMY_API_KEY`, `ADMIN_PRIVATE_KEY`, `SUMSUB_SECRET`. Add
+`SOLANA_RPC_URL` as a secret too only if you're bypassing Alchemy — when it's
+set, it wins over `ALCHEMY_API_KEY`.
 
-Optionally add these **repository variables**: `REJECTED_ROLE_ACTION`,
-`FAUCET_SOL_AMOUNT`. Leaving them unset keeps the defaults (`revoke`, no drip).
+Optionally add these **repository variables**: `SOLANA_CLUSTER`,
+`REJECTED_ROLE_ACTION`, `FAUCET_SOL_AMOUNT`. Leaving them unset keeps the
+defaults (`devnet`, `revoke`, no drip).
 
 ---
 
@@ -369,7 +381,9 @@ solana program show 2vVARM46pPD4rcHdbXHnYA4vTGN14q6skQAzsQWcHUxn --url devnet
 | `200` but `not a valid Solana public key` | `externalUserId` holds something that isn't a base58 Solana address (an address from another chain, an email, …) |
 | Approved user gets no role | The Sumsub `levelName` isn't in `KYC_LEVEL_ROLE_MAP` (see Step 2) |
 | `ADMIN_PRIVATE_KEY is NOT a registered whitelist admin` at startup | The key's address has no `["admin", …]` PDA — register it with `add_admin` from the sudo authority |
-| `AnchorError … ConstraintSeeds` / `AccountNotInitialized` | The admin isn't registered, or `SOLANA_RPC_URL` points at a cluster where the program isn't deployed |
+| `AnchorError … ConstraintSeeds` / `AccountNotInitialized` | The admin isn't registered, or the RPC points at a cluster where the program isn't deployed (check `cluster` / `rpc` in `/health`) |
+| `401`/`403` from the RPC, or `Could not reach the Solana RPC` at startup | `ALCHEMY_API_KEY` is wrong, or the Alchemy app doesn't have Solana on the configured `SOLANA_CLUSTER` enabled |
+| `The RPC endpoint serves a different cluster than SOLANA_CLUSTER says` | `SOLANA_CLUSTER` and the actual endpoint disagree — most often a stale `SOLANA_RPC_URL` still set in `.env`, which overrides Alchemy |
 | `Attempt to debit an account but found no record of a prior credit` | The admin account has no SOL |
 | `PermissionAlreadySet` (6001) | The permission is already at the requested value — harmless, and normally avoided by the read-before-write |
 | `WrongRentPayer` (6005) | `remove_role` was sent with a `rent_payer` other than the one stored on the role account |

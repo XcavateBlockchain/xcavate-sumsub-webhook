@@ -27,8 +27,72 @@ const logger = pino({
 });
 
 // ── Environment variables ───────────────────────────────────────────────
-const SOLANA_RPC_URL =
-  process.env.SOLANA_RPC_URL || "https://api.devnet.solana.com";
+
+/**
+ * RPC endpoint resolution, in order:
+ *
+ *  1. `SOLANA_RPC_URL` — an explicit endpoint always wins, so a self-hosted
+ *     or third-party node can be pointed at without touching anything else.
+ *  2. `ALCHEMY_API_KEY` — the normal setup. The endpoint is built for
+ *     `SOLANA_CLUSTER` (devnet unless set).
+ *  3. The public `api.<cluster>.solana.com` endpoint, as a last resort. It is
+ *     rate limited hard enough that it will drop webhook traffic in
+ *     production — the boot log says so when we land here.
+ *
+ * Note the truthiness checks: the deploy workflow writes every variable into
+ * `.env`, so an unset GitHub secret arrives as an empty string, not as undefined.
+ */
+const ALCHEMY_API_KEY = process.env.ALCHEMY_API_KEY || "";
+const SOLANA_CLUSTER = process.env.SOLANA_CLUSTER || "devnet";
+
+/** Alchemy's network slug per Solana cluster. Alchemy has no testnet node. */
+const ALCHEMY_NETWORK_BY_CLUSTER: Record<string, string> = {
+  devnet: "solana-devnet",
+  mainnet: "solana-mainnet",
+  "mainnet-beta": "solana-mainnet",
+};
+
+function resolveRpcUrl(): { url: string; source: string } {
+  if (process.env.SOLANA_RPC_URL) {
+    return { url: process.env.SOLANA_RPC_URL, source: "SOLANA_RPC_URL" };
+  }
+
+  const publicUrl = `https://api.${SOLANA_CLUSTER}.solana.com`;
+
+  if (ALCHEMY_API_KEY) {
+    const network = ALCHEMY_NETWORK_BY_CLUSTER[SOLANA_CLUSTER];
+    if (network) {
+      return {
+        url: `https://${network}.g.alchemy.com/v2/${ALCHEMY_API_KEY}`,
+        source: "Alchemy",
+      };
+    }
+    logger.error(
+      { cluster: SOLANA_CLUSTER, supported: Object.keys(ALCHEMY_NETWORK_BY_CLUSTER) },
+      "Alchemy has no endpoint for this SOLANA_CLUSTER — falling back to the " +
+        "public RPC. Set SOLANA_RPC_URL explicitly to use another provider.",
+    );
+  }
+
+  return { url: publicUrl, source: "public RPC (rate limited)" };
+}
+
+const { url: SOLANA_RPC_URL, source: SOLANA_RPC_SOURCE } = resolveRpcUrl();
+
+/** Host only — the Alchemy API key lives in the URL path and must not be logged. */
+const SOLANA_RPC_HOST = (() => {
+  try {
+    return new URL(SOLANA_RPC_URL).host;
+  } catch {
+    return "invalid-url";
+  }
+})();
+
+/** Strip the Alchemy key out of anything headed for a log or an HTTP response. */
+function redactSecrets(text: string): string {
+  return ALCHEMY_API_KEY ? text.split(ALCHEMY_API_KEY).join("***") : text;
+}
+
 const ADMIN_PRIVATE_KEY = process.env.ADMIN_PRIVATE_KEY || "";
 const SUMSUB_SECRET = process.env.SUMSUB_SECRET || "";
 const PORT = parseInt(process.env.PORT || "8005", 10);
@@ -399,7 +463,9 @@ function setPermissionIx(
 
 /** Turn an on-chain failure into something readable in the logs. */
 function describeError(err: unknown): string {
-  const message = err instanceof Error ? err.message : String(err);
+  // Redacted: transport errors quote the endpoint they failed on, which
+  // carries the Alchemy API key.
+  const message = redactSecrets(err instanceof Error ? err.message : String(err));
   const match = message.match(/custom program error: (0x[0-9a-fA-F]+)/);
   if (match) {
     const code = parseInt(match[1], 16);
@@ -787,6 +853,7 @@ app.get("/health", (_req: Request, res: Response) => {
   res.status(200).json({
     status: "ok",
     cluster: detectedCluster,
+    rpc: { host: SOLANA_RPC_HOST, source: SOLANA_RPC_SOURCE },
     programId: PROGRAM_ID.toBase58(),
     admin,
     adminIsRegistered,
@@ -804,8 +871,25 @@ async function preflight(): Promise<void> {
   try {
     const genesisHash = await connection.getGenesisHash();
     detectedCluster = CLUSTER_BY_GENESIS_HASH[genesisHash] || genesisHash;
+
+    // A cluster mismatch means every instruction is aimed at the wrong chain.
+    // Only meaningful when SOLANA_CLUSTER is what built the endpoint, or when
+    // it was set explicitly next to a hand-written SOLANA_RPC_URL.
+    const expected =
+      SOLANA_CLUSTER === "mainnet" ? "mainnet-beta" : SOLANA_CLUSTER;
+    const clusterIsDeclared =
+      SOLANA_RPC_SOURCE !== "SOLANA_RPC_URL" || !!process.env.SOLANA_CLUSTER;
+    if (clusterIsDeclared && detectedCluster !== expected) {
+      logger.warn(
+        { expected, detected: detectedCluster, rpcHost: SOLANA_RPC_HOST },
+        "The RPC endpoint serves a different cluster than SOLANA_CLUSTER says",
+      );
+    }
   } catch (err) {
-    logger.warn({ err: describeError(err) }, "Could not reach the Solana RPC");
+    logger.warn(
+      { err: describeError(err), rpcHost: SOLANA_RPC_HOST },
+      "Could not reach the Solana RPC",
+    );
   }
 
   let admin: Keypair;
@@ -822,6 +906,8 @@ async function preflight(): Promise<void> {
   logger.info(
     {
       cluster: detectedCluster,
+      rpcHost: SOLANA_RPC_HOST,
+      rpcSource: SOLANA_RPC_SOURCE,
       programId: PROGRAM_ID.toBase58(),
       config: configPda().toBase58(),
       admin: admin.publicKey.toBase58(),
@@ -866,6 +952,12 @@ async function preflight(): Promise<void> {
 // ── Start server ──────────────────────────────────────────────────────
 const server = app.listen(PORT, () => {
   logger.info(`Sumsub webhook server listening on port ${PORT}`);
+  if (!ALCHEMY_API_KEY && !process.env.SOLANA_RPC_URL) {
+    logger.warn(
+      "Neither ALCHEMY_API_KEY nor SOLANA_RPC_URL is set — falling back to " +
+        `${SOLANA_RPC_HOST}, whose rate limits will drop transactions under load.`,
+    );
+  }
   if (!SUMSUB_SECRET) {
     logger.warn(
       "SUMSUB_SECRET is not set — webhook signatures are NOT verified. " +

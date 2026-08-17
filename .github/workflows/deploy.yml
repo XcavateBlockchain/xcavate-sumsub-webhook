@@ -38,6 +38,8 @@ jobs:
 
             # Copy environment variables from secrets (set these in GitHub)
             cat > .env <<EOF
+            ALCHEMY_API_KEY=${{ secrets.ALCHEMY_API_KEY }}
+            SOLANA_CLUSTER=${{ vars.SOLANA_CLUSTER }}
             SOLANA_RPC_URL=${{ secrets.SOLANA_RPC_URL }}
             ADMIN_PRIVATE_KEY='${{ secrets.ADMIN_PRIVATE_KEY }}'
             REJECTED_ROLE_ACTION=${{ vars.REJECTED_ROLE_ACTION }}

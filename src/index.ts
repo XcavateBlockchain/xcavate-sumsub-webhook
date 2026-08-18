@@ -222,20 +222,6 @@ interface SumsubPayload {
   reviewStatus?: string;
   reviewResult?: SumsubReviewResult;
   sandboxMode?: boolean;
-
-  // Legacy / custom wrapper (backward compatibility)
-  event?: string;
-  data?: {
-    caseId?: string;
-    applicantId?: string;
-    levelName?: string;
-    reviewStatus?: string;
-    status?: string;
-    externalUserId?: string;
-    fields?: Array<{ name: string; value: string }>;
-    attributes?: Record<string, unknown>;
-    case?: Record<string, unknown>;
-  };
 }
 
 // ── Solana connection & admin signer ────────────────────────────────────
@@ -245,7 +231,7 @@ const connection = new Connection(SOLANA_RPC_URL, "confirmed");
 /** Genesis hashes, used to report which cluster we actually ended up on. */
 const CLUSTER_BY_GENESIS_HASH: Record<string, string> = {
   "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d": "mainnet-beta",
-  EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG: "devnet",
+  "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG": "devnet",
   "4uhcVJyU9pJkvQyS88uRDiswHXSCkY3zQawwpjk2NsNY": "testnet",
 };
 

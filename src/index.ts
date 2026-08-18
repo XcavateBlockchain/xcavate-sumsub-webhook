@@ -194,15 +194,20 @@ const KYC_LEVEL_ROLE_MAP: Record<string, Role | undefined> = {
 //
 // Sumsub sends review results at the TOP LEVEL of the body, e.g.:
 //   {
-//     "type": "applicantReviewed",
-//     "applicantId": "...",
+//     "applicantId": "5cb56e8e0a975a35f333cb83",
+//     "inspectionId": "5cb56e8e0a975a35f333cb84",
+//     "applicantType": "individual",
+//     "correlationId": "req-a260b669-4f14-4bb5-a4c5-ac0218acb9a4",
 //     "externalUserId": "<wallet address>",
 //     "levelName": "csharp-verification-investor",
+//     "type": "applicantReviewed",
+//     "sandboxMode": false,
+//     "reviewResult": { "reviewAnswer": "GREEN" | "RED", ... },
 //     "reviewStatus": "completed",
-//     "reviewResult": { "reviewAnswer": "GREEN" | "RED", ... }
+//     "createdAtMs": "2020-02-21 13:23:19.321",
+//     "clientId": "coolClientId"
 //   }
-// The legacy `event` / `data` wrapper below is kept only for backward
-// compatibility with custom callers and the local test payload.
+// This is the only shape the service accepts.
 interface SumsubReviewResult {
   reviewAnswer?: string;
   reviewRejectType?: string;
@@ -212,16 +217,18 @@ interface SumsubReviewResult {
 }
 
 interface SumsubPayload {
-  // Native Sumsub fields (top level)
   type?: string;
   applicantId?: string;
   inspectionId?: string;
+  applicantType?: string;
   correlationId?: string;
   externalUserId?: string;
   levelName?: string;
   reviewStatus?: string;
   reviewResult?: SumsubReviewResult;
   sandboxMode?: boolean;
+  createdAtMs?: string;
+  clientId?: string;
 }
 
 // ── Solana connection & admin signer ────────────────────────────────────
@@ -541,47 +548,11 @@ async function setPermission(
 
 // ── Webhook processing ──────────────────────────────────────────────────
 
-/** Keys we accept as the user's wallet address, in priority order. */
-const WALLET_KEYS = ["walletAddress", "accountAddress", "address", "wallet"];
-
-/**
- * Pull the user's wallet address out of whatever payload shape arrived.
- *
- * Recommended (native Sumsub): the address is stored in `externalUserId`,
- * which you set when the applicant is created. We also keep the legacy
- * fallbacks (custom `fields` array / `attributes` / `case` objects) so
- * existing custom callers keep working.
- */
-function extractWalletAddress(body: SumsubPayload): string | null {
-  // 1. Explicit wallet-named entry in a custom `fields` array (legacy)
-  if (body.data?.fields) {
-    for (const f of body.data.fields) {
-      if (WALLET_KEYS.includes(f.name)) return f.value;
-    }
-  }
-
-  // 2. Explicit wallet-named key in `attributes` / `case` objects (legacy)
-  for (const container of [body.data?.attributes, body.data?.case]) {
-    if (container) {
-      for (const key of WALLET_KEYS) {
-        if (container[key]) return String(container[key]);
-      }
-    }
-  }
-
-  // 3. externalUserId — the recommended place to stash the wallet address
-  const ext = body.externalUserId ?? body.data?.externalUserId;
-  if (ext) return String(ext);
-
-  return null;
-}
-
 async function processSumsubWebhook(body: SumsubPayload): Promise<void> {
-  // Normalise across native Sumsub and legacy custom shapes.
-  const eventType = body.type || body.event || "";
-  const levelName = body.levelName || body.data?.levelName || "";
+  const eventType = body.type ?? "";
+  const levelName = body.levelName ?? "";
   const reviewAnswer = body.reviewResult?.reviewAnswer;
-  const caseId = body.applicantId || body.data?.applicantId || body.data?.caseId;
+  const caseId = body.applicantId;
 
   logger.info(
     { eventType, caseId, levelName, reviewAnswer },
@@ -590,27 +561,27 @@ async function processSumsubWebhook(body: SumsubPayload): Promise<void> {
 
   // Sumsub emits many event types, but only the final review decides a
   // user's role. Acknowledge everything else with 200 so Sumsub stops
-  // retrying. Payloads without a `type` (legacy/custom callers and the local
-  // test) fall through to the heuristic below.
-  if (body.type && body.type !== "applicantReviewed") {
+  // retrying.
+  if (eventType !== "applicantReviewed") {
     logger.info({ eventType }, "Non-decision event, acknowledging without action");
     return;
   }
 
-  // Approval:
-  //  - Native Sumsub: reviewResult.reviewAnswer === "GREEN" → approved, "RED" → rejected.
-  //  - Legacy payloads (no reviewResult): treat any concrete level as approved.
-  const isApproved =
-    reviewAnswer !== undefined
-      ? reviewAnswer === "GREEN"
-      : levelName !== "none" && levelName !== "";
+  // reviewResult.reviewAnswer === "GREEN" → approved, anything else → rejected.
+  if (reviewAnswer === undefined) {
+    logger.warn({ caseId }, "applicantReviewed without reviewResult, skipping");
+    return;
+  }
+  const isApproved = reviewAnswer === "GREEN";
 
   const role = KYC_LEVEL_ROLE_MAP[levelName];
   const roleName = role !== undefined ? ROLE_NAMES[role] : null;
 
-  const accountAddress = extractWalletAddress(body);
+  // The wallet address is carried in `externalUserId`, which you set when the
+  // applicant is created and Sumsub echoes back on every event.
+  const accountAddress = body.externalUserId;
   if (!accountAddress) {
-    logger.warn({ caseId }, "No wallet address found in payload, skipping");
+    logger.warn({ caseId }, "No externalUserId in payload, skipping");
     return;
   }
 

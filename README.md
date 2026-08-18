@@ -124,15 +124,11 @@ POST https://api.sumsub.com/resources/accessTokens
 (or pass `externalUserId` when creating the applicant via
 `POST /resources/applicants?levelName=...`).
 
-The service resolves the destination account in this priority order:
+The service reads the destination account from **`externalUserId`** only.
 
-1. A custom `fields[]` entry named `walletAddress` / `accountAddress` / `address` / `wallet`
-2. A `walletAddress`-style key inside an `attributes` or `case` object
-3. **`externalUserId`** ← recommended for native Sumsub webhooks
-
-If none of these contain a valid Solana public key, the webhook is acknowledged
-(HTTP 200) but **no on-chain action is taken** — check the logs for
-`No wallet address found` or `not a valid Solana public key`.
+If it is missing or does not contain a valid Solana public key, the webhook is
+acknowledged (HTTP 200) but **no on-chain action is taken** — check the logs for
+`No externalUserId in payload` or `not a valid Solana public key`.
 
 ### Step 2 — Create the verification levels
 
@@ -240,12 +236,10 @@ Fields the service reads:
 | `type` | Only `applicantReviewed` triggers action; others are acknowledged and skipped |
 | `reviewResult.reviewAnswer` | `GREEN` → approve, `RED` → revoke |
 | `levelName` | Maps to the role (see table above) |
-| `externalUserId` | The user's Solana wallet address (see Step 1 for alternatives) |
+| `externalUserId` | The user's Solana wallet address (see Step 1) |
 
-> **Backward compatibility:** payloads that use the older custom shape
-> (`{ "event": ..., "data": { "levelName": ..., "fields": [...] } }`) are still
-> accepted. When no `reviewResult` is present, any non-empty `levelName` other
-> than `none` is treated as approved.
+> Only the native top-level Sumsub shape is accepted. An `applicantReviewed`
+> event without a `reviewResult` is acknowledged and skipped.
 
 ---
 

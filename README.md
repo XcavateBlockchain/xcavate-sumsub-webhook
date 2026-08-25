@@ -16,7 +16,7 @@ All other Sumsub events are acknowledged and ignored.
 
 | | |
 |---|---|
-| **Program** | [`2vVARM46pPD4rcHdbXHnYA4vTGN14q6skQAzsQWcHUxn`](https://explorer.solana.com/address/2vVARM46pPD4rcHdbXHnYA4vTGN14q6skQAzsQWcHUxn?cluster=devnet) |
+| **Program** | [`7TrzjKpdrEhnfhxuw8tWdH1sjxadazscsG5HXCDPLmaY`](https://explorer.solana.com/address/7TrzjKpdrEhnfhxuw8tWdH1sjxadazscsG5HXCDPLmaY?cluster=devnet) |
 | **Cluster** | Devnet (set `SOLANA_CLUSTER=mainnet-beta` for anything else) |
 | **RPC** | Alchemy — `ALCHEMY_API_KEY` + `SOLANA_CLUSTER` (override with `SOLANA_RPC_URL`) |
 | **Source** | [XcavateBlockchain/realxmarket-solana](https://github.com/XcavateBlockchain/realxmarket-solana) |
@@ -44,7 +44,7 @@ curl http://localhost:8005/health
 {
   "status": "ok",
   "cluster": "devnet",
-  "programId": "2vVARM46pPD4rcHdbXHnYA4vTGN14q6skQAzsQWcHUxn",
+  "programId": "7TrzjKpdrEhnfhxuw8tWdH1sjxadazscsG5HXCDPLmaY",
   "admin": "D7LHTCvNtG37QsZSphsCTkJhLhg3SfpyjqMBwtfqbvaP",
   "adminIsRegistered": true
 }
@@ -361,7 +361,7 @@ To inspect what's already on chain:
 
 ```bash
 solana account <ROLE_ACCOUNT_PDA> --url devnet
-solana program show 2vVARM46pPD4rcHdbXHnYA4vTGN14q6skQAzsQWcHUxn --url devnet
+solana program show 7TrzjKpdrEhnfhxuw8tWdH1sjxadazscsG5HXCDPLmaY --url devnet
 ```
 
 ---

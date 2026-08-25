@@ -1,5 +1,5 @@
 {
-  "address": "2vVARM46pPD4rcHdbXHnYA4vTGN14q6skQAzsQWcHUxn",
+  "address": "7TrzjKpdrEhnfhxuw8tWdH1sjxadazscsG5HXCDPLmaY",
   "metadata": {
     "name": "xcavate_whitelist",
     "version": "0.1.0",
@@ -20,7 +20,16 @@
       "docs": [
         "Complete the authority handover. Signed by the pending authority."
       ],
-      "discriminator": [107, 86, 198, 91, 33, 12, 107, 160],
+      "discriminator": [
+        107,
+        86,
+        198,
+        91,
+        33,
+        12,
+        107,
+        160
+      ],
       "accounts": [
         {
           "name": "new_authority",
@@ -33,7 +42,14 @@
             "seeds": [
               {
                 "kind": "const",
-                "value": [99, 111, 110, 102, 105, 103]
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
               }
             ]
           }
@@ -43,14 +59,27 @@
     },
     {
       "name": "add_admin",
-      "docs": ["Register a whitelist admin. Sudo-only."],
-      "discriminator": [177, 236, 33, 205, 124, 152, 55, 186],
+      "docs": [
+        "Register a whitelist admin. Sudo-only."
+      ],
+      "discriminator": [
+        177,
+        236,
+        33,
+        205,
+        124,
+        152,
+        55,
+        186
+      ],
       "accounts": [
         {
           "name": "authority",
           "writable": true,
           "signer": true,
-          "relations": ["config"]
+          "relations": [
+            "config"
+          ]
         },
         {
           "name": "config",
@@ -58,7 +87,14 @@
             "seeds": [
               {
                 "kind": "const",
-                "value": [99, 111, 110, 102, 105, 103]
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
               }
             ]
           }
@@ -73,7 +109,13 @@
             "seeds": [
               {
                 "kind": "const",
-                "value": [97, 100, 109, 105, 110]
+                "value": [
+                  97,
+                  100,
+                  109,
+                  105,
+                  110
+                ]
               },
               {
                 "kind": "account",
@@ -91,8 +133,19 @@
     },
     {
       "name": "assign_role",
-      "docs": ["Assign a role to a user (default Compliant). Admin-only."],
-      "discriminator": [255, 174, 125, 180, 203, 155, 202, 131],
+      "docs": [
+        "Assign a role to a user (default Compliant). Admin-only."
+      ],
+      "discriminator": [
+        255,
+        174,
+        125,
+        180,
+        203,
+        155,
+        202,
+        131
+      ],
       "accounts": [
         {
           "name": "admin_signer",
@@ -101,12 +154,20 @@
         },
         {
           "name": "admin",
-          "docs": ["Proves `admin_signer` is a registered admin (PDA must exist)."],
+          "docs": [
+            "Proves `admin_signer` is a registered admin (PDA must exist)."
+          ],
           "pda": {
             "seeds": [
               {
                 "kind": "const",
-                "value": [97, 100, 109, 105, 110]
+                "value": [
+                  97,
+                  100,
+                  109,
+                  105,
+                  110
+                ]
               },
               {
                 "kind": "account",
@@ -140,8 +201,19 @@
     },
     {
       "name": "initialize_config",
-      "docs": ["Initialize the singleton config; sets sudo authority to the signer."],
-      "discriminator": [208, 127, 21, 1, 194, 190, 196, 70],
+      "docs": [
+        "Initialize the singleton config; sets sudo authority to the signer."
+      ],
+      "discriminator": [
+        208,
+        127,
+        21,
+        1,
+        194,
+        190,
+        196,
+        70
+      ],
       "accounts": [
         {
           "name": "authority",
@@ -150,12 +222,16 @@
         },
         {
           "name": "program",
-          "docs": ["This program's executable account, tying `program_data` to it."],
-          "address": "2vVARM46pPD4rcHdbXHnYA4vTGN14q6skQAzsQWcHUxn"
+          "docs": [
+            "This program's executable account, tying `program_data` to it."
+          ],
+          "address": "7TrzjKpdrEhnfhxuw8tWdH1sjxadazscsG5HXCDPLmaY"
         },
         {
           "name": "program_data",
-          "docs": ["The program's upgrade authority must be the initializing signer."]
+          "docs": [
+            "The program's upgrade authority must be the initializing signer."
+          ]
         },
         {
           "name": "config",
@@ -164,7 +240,14 @@
             "seeds": [
               {
                 "kind": "const",
-                "value": [99, 111, 110, 102, 105, 103]
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
               }
             ]
           }
@@ -178,14 +261,27 @@
     },
     {
       "name": "remove_admin",
-      "docs": ["Remove a whitelist admin. Sudo-only."],
-      "discriminator": [74, 202, 71, 106, 252, 31, 72, 183],
+      "docs": [
+        "Remove a whitelist admin. Sudo-only."
+      ],
+      "discriminator": [
+        74,
+        202,
+        71,
+        106,
+        252,
+        31,
+        72,
+        183
+      ],
       "accounts": [
         {
           "name": "authority",
           "writable": true,
           "signer": true,
-          "relations": ["config"]
+          "relations": [
+            "config"
+          ]
         },
         {
           "name": "config",
@@ -193,7 +289,14 @@
             "seeds": [
               {
                 "kind": "const",
-                "value": [99, 111, 110, 102, 105, 103]
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
               }
             ]
           }
@@ -205,7 +308,13 @@
             "seeds": [
               {
                 "kind": "const",
-                "value": [97, 100, 109, 105, 110]
+                "value": [
+                  97,
+                  100,
+                  109,
+                  105,
+                  110
+                ]
               },
               {
                 "kind": "arg",
@@ -224,8 +333,19 @@
     },
     {
       "name": "remove_role",
-      "docs": ["Remove a role from a user. Admin-only."],
-      "discriminator": [74, 69, 168, 163, 248, 3, 130, 0],
+      "docs": [
+        "Remove a role from a user. Admin-only."
+      ],
+      "discriminator": [
+        74,
+        69,
+        168,
+        163,
+        248,
+        3,
+        130,
+        0
+      ],
       "accounts": [
         {
           "name": "admin_signer",
@@ -237,7 +357,13 @@
             "seeds": [
               {
                 "kind": "const",
-                "value": [97, 100, 109, 105, 110]
+                "value": [
+                  97,
+                  100,
+                  109,
+                  105,
+                  110
+                ]
               },
               {
                 "kind": "account",
@@ -271,8 +397,19 @@
     },
     {
       "name": "renounce_role",
-      "docs": ["Give up one's own role. Signed by the role holder."],
-      "discriminator": [21, 253, 233, 162, 186, 216, 217, 26],
+      "docs": [
+        "Give up one's own role. Signed by the role holder."
+      ],
+      "discriminator": [
+        21,
+        253,
+        233,
+        162,
+        186,
+        216,
+        217,
+        26
+      ],
       "accounts": [
         {
           "name": "user",
@@ -300,8 +437,19 @@
     },
     {
       "name": "set_permission",
-      "docs": ["Update a user's compliance status for a role. Admin-only."],
-      "discriminator": [70, 126, 41, 194, 245, 189, 128, 8],
+      "docs": [
+        "Update a user's compliance status for a role. Admin-only."
+      ],
+      "discriminator": [
+        70,
+        126,
+        41,
+        194,
+        245,
+        189,
+        128,
+        8
+      ],
       "accounts": [
         {
           "name": "admin_signer",
@@ -313,7 +461,13 @@
             "seeds": [
               {
                 "kind": "const",
-                "value": [97, 100, 109, 105, 110]
+                "value": [
+                  97,
+                  100,
+                  109,
+                  105,
+                  110
+                ]
               },
               {
                 "kind": "account",
@@ -351,13 +505,26 @@
     },
     {
       "name": "update_authority",
-      "docs": ["Propose a new sudo authority (two-step handover). Current-authority-only."],
-      "discriminator": [32, 46, 64, 28, 149, 75, 243, 88],
+      "docs": [
+        "Propose a new sudo authority (two-step handover). Current-authority-only."
+      ],
+      "discriminator": [
+        32,
+        46,
+        64,
+        28,
+        149,
+        75,
+        243,
+        88
+      ],
       "accounts": [
         {
           "name": "authority",
           "signer": true,
-          "relations": ["config"]
+          "relations": [
+            "config"
+          ]
         },
         {
           "name": "config",
@@ -366,7 +533,14 @@
             "seeds": [
               {
                 "kind": "const",
-                "value": [99, 111, 110, 102, 105, 103]
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
               }
             ]
           }
@@ -383,49 +557,148 @@
   "accounts": [
     {
       "name": "Admin",
-      "discriminator": [244, 158, 220, 65, 8, 73, 4, 65]
+      "discriminator": [
+        244,
+        158,
+        220,
+        65,
+        8,
+        73,
+        4,
+        65
+      ]
     },
     {
       "name": "Config",
-      "discriminator": [155, 12, 170, 224, 30, 250, 204, 130]
+      "discriminator": [
+        155,
+        12,
+        170,
+        224,
+        30,
+        250,
+        204,
+        130
+      ]
     },
     {
       "name": "RoleAccount",
-      "discriminator": [142, 236, 135, 197, 214, 3, 244, 226]
+      "discriminator": [
+        142,
+        236,
+        135,
+        197,
+        214,
+        3,
+        244,
+        226
+      ]
     }
   ],
   "events": [
     {
       "name": "AdminRegistered",
-      "discriminator": [147, 108, 44, 209, 10, 13, 4, 0]
+      "discriminator": [
+        147,
+        108,
+        44,
+        209,
+        10,
+        13,
+        4,
+        0
+      ]
     },
     {
       "name": "AdminRemoved",
-      "discriminator": [59, 133, 36, 27, 156, 79, 75, 146]
+      "discriminator": [
+        59,
+        133,
+        36,
+        27,
+        156,
+        79,
+        75,
+        146
+      ]
     },
     {
       "name": "AuthorityUpdateProposed",
-      "discriminator": [238, 208, 182, 30, 132, 56, 128, 252]
+      "discriminator": [
+        238,
+        208,
+        182,
+        30,
+        132,
+        56,
+        128,
+        252
+      ]
     },
     {
       "name": "AuthorityUpdated",
-      "discriminator": [133, 207, 24, 122, 14, 234, 91, 34]
+      "discriminator": [
+        133,
+        207,
+        24,
+        122,
+        14,
+        234,
+        91,
+        34
+      ]
     },
     {
       "name": "ConfigInitialized",
-      "discriminator": [181, 49, 200, 156, 19, 167, 178, 91]
+      "discriminator": [
+        181,
+        49,
+        200,
+        156,
+        19,
+        167,
+        178,
+        91
+      ]
     },
     {
       "name": "PermissionUpdated",
-      "discriminator": [82, 173, 224, 81, 165, 91, 56, 31]
+      "discriminator": [
+        82,
+        173,
+        224,
+        81,
+        165,
+        91,
+        56,
+        31
+      ]
     },
     {
       "name": "RoleAssigned",
-      "discriminator": [15, 207, 225, 171, 169, 117, 98, 131]
+      "discriminator": [
+        15,
+        207,
+        225,
+        171,
+        169,
+        117,
+        98,
+        131
+      ]
     },
     {
       "name": "RoleRemoved",
-      "discriminator": [133, 35, 214, 234, 203, 157, 203, 53]
+      "discriminator": [
+        133,
+        35,
+        214,
+        234,
+        203,
+        157,
+        203,
+        53
+      ]
     }
   ],
   "errors": [
@@ -487,7 +760,9 @@
     },
     {
       "name": "Admin",
-      "docs": ["Marks an address as a whitelist admin."],
+      "docs": [
+        "Marks an address as a whitelist admin."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -560,13 +835,17 @@
     },
     {
       "name": "Config",
-      "docs": ["Singleton config holding the sudo authority that manages admins."],
+      "docs": [
+        "Singleton config holding the sudo authority that manages admins."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
           {
             "name": "authority",
-            "docs": ["Sudo authority allowed to add/remove admins."],
+            "docs": [
+              "Sudo authority allowed to add/remove admins."
+            ],
             "type": "pubkey"
           },
           {
@@ -664,7 +943,9 @@
     },
     {
       "name": "RoleAccount",
-      "docs": ["One (user, role) assignment together with its compliance status."],
+      "docs": [
+        "One (user, role) assignment together with its compliance status."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -747,19 +1028,25 @@
   "constants": [
     {
       "name": "ADMIN_SEED",
-      "docs": ["PDA seed for an admin marker account."],
+      "docs": [
+        "PDA seed for an admin marker account."
+      ],
       "type": "bytes",
       "value": "[97, 100, 109, 105, 110]"
     },
     {
       "name": "CONFIG_SEED",
-      "docs": ["PDA seed for the singleton program config (sudo authority)."],
+      "docs": [
+        "PDA seed for the singleton program config (sudo authority)."
+      ],
       "type": "bytes",
       "value": "[99, 111, 110, 102, 105, 103]"
     },
     {
       "name": "ROLE_SEED",
-      "docs": ["PDA seed for a per-(user, role) assignment account."],
+      "docs": [
+        "PDA seed for a per-(user, role) assignment account."
+      ],
       "type": "bytes",
       "value": "[114, 111, 108, 101]"
     }

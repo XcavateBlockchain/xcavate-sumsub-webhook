@@ -6,7 +6,10 @@ Webhook service that bridges Sumsub KYC results with the **realXmarket
 When a Sumsub applicant is **reviewed and approved** (`reviewAnswer = GREEN`),
 the service assigns the role that matches the KYC level — calling `assign_role`
 if the user doesn't hold it yet, or `set_permission(Compliant)` if a previously
-revoked assignment is still on chain.
+revoked assignment is still on chain. Once that transaction has confirmed it
+also **airdrops 0.01 SOL + 10000 tGBP** ([`71G3dc4B…9HUb`](https://explorer.solana.com/address/71G3dc4B9p9QBosLx3XhWY3ULRPAxjopngsin66M9HUb?cluster=devnet))
+to the user in a separate, best-effort transaction — a failed airdrop never
+affects the role assignment.
 
 When an applicant is **reviewed and rejected** (`reviewAnswer = RED`), the
 matching assignment is revoked (`set_permission(Revoked)`), or removed outright
@@ -83,9 +86,20 @@ ADMIN_PRIVATE_KEY=[174,47,...]        # the raw secret key
 ADMIN_PRIVATE_KEY=/etc/xcavate/admin.json   # or a path to it
 ```
 
-On startup the service checks both requirements and logs a loud error if the
-key isn't a registered admin or has a zero balance — that's much easier to spot
-at boot than in a failed webhook an hour later.
+### The tGBP airdrop balance
+
+Approved users also receive an airdrop of **0.01 SOL + 10000 tGBP** (mint
+[`71G3dc4B9p9QBosLx3XhWY3ULRPAxjopngsin66M9HUb`](https://explorer.solana.com/address/71G3dc4B9p9QBosLx3XhWY3ULRPAxjopngsin66M9HUb?cluster=devnet)),
+paid from the admin account. The tGBP leaves the admin's **associated token
+account** for that mint, so before the first approval send at least 10000 tGBP
+to the admin's ATA on devnet (the service logs the exact address at startup).
+The airdrop is best-effort: when the balance runs dry it is logged and skipped,
+and the role assignment is still applied.
+
+On startup the service checks all three requirements and logs a loud error if
+the key isn't a registered admin, has a zero SOL balance, or the admin's tGBP
+token account is missing/underfunded — that's much easier to spot at boot than
+in a failed webhook an hour later.
 
 > 🔑 The admin key can whitelist arbitrary wallets. Treat it as a production
 > secret; never commit it.
@@ -264,8 +278,15 @@ Notes:
   assigned** — hence the read-before-write above.
 - `remove_role` refunds the account's rent to whoever paid it at assignment, so
   the service reads `rent_payer` off the account and passes it back.
-- Everything the service sends goes out as a **single transaction**, which
-  Solana executes atomically: all of it lands, or none of it does.
+- Role changes go out as a **single transaction**, which Solana executes
+  atomically: all of it lands, or none of it does.
+- The tGBP/SOL airdrop on approval is a **separate transaction**, sent only
+  after the role transaction has confirmed. It bundles the SOL transfer, an
+  idempotent creation of the user's tGBP token account, and the tGBP transfer.
+  If it fails (admin out of tGBP, RPC hiccup, …) it is logged and dropped —
+  the role change has already landed and Sumsub's 200 ack is unaffected.
+  Because it only fires when a role change actually happened, redelivered
+  webhooks don't airdrop twice.
 - The client is driven by [the IDL](src/idl/xcavate_whitelist.json): program id,
   discriminators, account ordering and signer/writable flags all come from that
   file. After a program upgrade, drop in the regenerated IDL.
@@ -375,6 +396,8 @@ solana program show 7TrzjKpdrEhnfhxuw8tWdH1sjxadazscsG5HXCDPLmaY --url devnet
 | `200` but `not a valid Solana public key` | `externalUserId` holds something that isn't a base58 Solana address (an address from another chain, an email, …) |
 | Approved user gets no role | The Sumsub `levelName` isn't in `KYC_LEVEL_ROLE_MAP` (see Step 2) |
 | `ADMIN_PRIVATE_KEY is NOT a registered whitelist admin` at startup | The key's address has no `["admin", …]` PDA — register it with `add_admin` from the sudo authority |
+| `Admin tGBP token account does not exist` / `Admin tGBP balance is below the 10000 airdrop amount` at startup | Send ≥ 10000 tGBP to the admin's tGBP associated token account (address in the log) — until then every airdrop fails, role assignments are unaffected |
+| `Airdrop failed` in the webhook logs while the role was assigned | Same cause as above — check the admin's tGBP balance and top up; the airdrop is best-effort by design |
 | `AnchorError … ConstraintSeeds` / `AccountNotInitialized` | The admin isn't registered, or the RPC points at a cluster where the program isn't deployed (check `cluster` / `rpc` in `/health`) |
 | `401`/`403` from the RPC, or `Could not reach the Solana RPC` at startup | `ALCHEMY_API_KEY` is wrong, or the Alchemy app doesn't have Solana on the configured `SOLANA_CLUSTER` enabled |
 | `The RPC endpoint serves a different cluster than SOLANA_CLUSTER says` | `SOLANA_CLUSTER` and the actual endpoint disagree — most often a stale `SOLANA_RPC_URL` still set in `.env`, which overrides Alchemy |

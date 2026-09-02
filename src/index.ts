@@ -9,6 +9,11 @@ import {
   TransactionInstruction,
   sendAndConfirmTransaction,
 } from "@solana/web3.js";
+import {
+  createAssociatedTokenAccountIdempotentInstructionWithDerivation,
+  createTransferInstruction,
+  getAssociatedTokenAddressSync,
+} from "@solana/spl-token";
 import crypto from "crypto";
 import fs from "fs";
 import dotenv from "dotenv";
@@ -118,6 +123,21 @@ const FAUCET_SOL_AMOUNT = parseFloat(process.env.FAUCET_SOL_AMOUNT || "0");
 const FAUCET_SOL_LAMPORTS = Number.isFinite(FAUCET_SOL_AMOUNT)
   ? Math.round(FAUCET_SOL_AMOUNT * LAMPORTS_PER_SOL)
   : 0;
+
+/**
+ * Airdrop for newly approved users, paid from the admin account: 0.01 SOL
+ * plus 10000 tGBP (the devnet tGBP SPL token below). It rides in its own
+ * transaction — Solana executes transactions atomically, so bundling it with
+ * the role instruction would let a failed transfer (e.g. the admin's tGBP
+ * balance running out) roll the role assignment back, which must not happen.
+ * A failed airdrop is logged and dropped; the role change has confirmed by
+ * then.
+ */
+const AIRDROP_SOL_LAMPORTS = Math.round(0.01 * LAMPORTS_PER_SOL);
+const AIRDROP_TGBP_AMOUNT = 10_000;
+const TGBP_MINT = new PublicKey(
+  "71G3dc4B9p9QBosLx3XhWY3ULRPAxjopngsin66M9HUb",
+);
 
 // ── IDL ─────────────────────────────────────────────────────────────────
 // The client is driven by the program IDL: program id, instruction
@@ -433,6 +453,20 @@ function removeRoleIx(
   );
 }
 
+/**
+ * Idempotently create `owner`'s associated token account for `mint` — a
+ * no-op when the account already exists. Without it a first-time user's
+ * tGBP transfer has no destination account to land in. The admin pays the
+ * rent and signs the transaction.
+ */
+function createAtaIx(mint: PublicKey, owner: PublicKey): TransactionInstruction {
+  return createAssociatedTokenAccountIdempotentInstructionWithDerivation(
+    getAdmin().publicKey,
+    owner,
+    mint,
+  );
+}
+
 /** set_permission(role, permission) — flip a user's compliance status. */
 function setPermissionIx(
   user: PublicKey,
@@ -546,6 +580,49 @@ async function setPermission(
   );
 }
 
+// ── Token airdrop ───────────────────────────────────────────────────────
+
+/** tGBP mint decimals — fetched lazily, cached for the process lifetime. */
+let tgbpDecimals: number | null = null;
+
+async function fetchTgbpDecimals(): Promise<number> {
+  if (tgbpDecimals === null) {
+    const { value } = await connection.getTokenSupply(TGBP_MINT);
+    tgbpDecimals = value.decimals;
+  }
+  return tgbpDecimals;
+}
+
+/**
+ * Airdrop 0.01 SOL + 10000 tGBP to `user`, one atomic transaction: SOL
+ * transfer, idempotent creation of the user's token account, and the tGBP
+ * transfer out of the admin's own associated token account, which must hold
+ * at least `AIRDROP_TGBP_AMOUNT` tGBP.
+ */
+async function airdropTokens(user: PublicKey): Promise<string> {
+  const admin = getAdmin().publicKey;
+  const decimals = await fetchTgbpDecimals();
+  const amount = BigInt(AIRDROP_TGBP_AMOUNT) * 10n ** BigInt(decimals);
+
+  return submitTransaction(
+    [
+      SystemProgram.transfer({
+        fromPubkey: admin,
+        toPubkey: user,
+        lamports: AIRDROP_SOL_LAMPORTS,
+      }),
+      createAtaIx(TGBP_MINT, user),
+      createTransferInstruction(
+        getAssociatedTokenAddressSync(TGBP_MINT, admin),
+        getAssociatedTokenAddressSync(TGBP_MINT, user),
+        admin,
+        amount,
+      ),
+    ],
+    "airdrop",
+  );
+}
+
 // ── Webhook processing ──────────────────────────────────────────────────
 
 async function processSumsubWebhook(body: SumsubPayload): Promise<void> {
@@ -614,8 +691,10 @@ async function processSumsubWebhook(body: SumsubPayload): Promise<void> {
 
 /**
  * Approved: make sure the user holds the mapped role and is marked
- * Compliant, then (optionally) drip some SOL. Both instructions ride in one
- * transaction so they land together or not at all.
+ * Compliant — optionally with an extra SOL drip riding in the same
+ * transaction so they land together or not at all. Then, once that
+ * transaction has confirmed, airdrop 0.01 SOL + 10000 tGBP in a separate
+ * best-effort transaction (see `airdropTokens`).
  */
 async function handleApproved(
   user: PublicKey,
@@ -661,15 +740,33 @@ async function handleApproved(
   if (instructions.length === 0) return;
 
   const signature = await submitTransaction(instructions, "approved");
-  logger.info(
-    {
-      user: user.toBase58(),
-      role: roleName,
-      lamports: FAUCET_SOL_LAMPORTS || undefined,
-      signature,
-    },
-    "Approved flow executed",
-  );
+
+  // Best-effort airdrop in its own transaction: the role change has already
+  // confirmed, so a failure here is logged and dropped — it cannot roll the
+  // assignment back or surface as a webhook error.
+  try {
+    const airdropSignature = await airdropTokens(user);
+    logger.info(
+      {
+        user: user.toBase58(),
+        role: roleName,
+        lamports: FAUCET_SOL_LAMPORTS || undefined,
+        signature,
+        airdropSignature,
+      },
+      "Approved flow executed",
+    );
+  } catch (err) {
+    logger.error(
+      {
+        err: describeError(err),
+        user: user.toBase58(),
+        role: roleName,
+        signature,
+      },
+      "Airdrop failed — the role assignment already confirmed and is unaffected",
+    );
+  }
 }
 
 /**
@@ -870,6 +967,11 @@ async function preflight(): Promise<void> {
       admin: admin.publicKey.toBase58(),
       rejectedRoleAction: REJECTED_ROLE_ACTION,
       faucetLamports: FAUCET_SOL_LAMPORTS,
+      airdrop: {
+        sol: AIRDROP_SOL_LAMPORTS / LAMPORTS_PER_SOL,
+        tgbp: AIRDROP_TGBP_AMOUNT,
+        mint: TGBP_MINT.toBase58(),
+      },
     },
     "Solana client ready",
   );
@@ -903,6 +1005,50 @@ async function preflight(): Promise<void> {
     }
   } catch (err) {
     logger.warn({ err: describeError(err) }, "Admin preflight check failed");
+  }
+
+  // Airdrop funding: the tGBP mint must exist on this cluster and the
+  // admin's associated token account must hold at least one airdrop's worth.
+  // A short balance only breaks the best-effort airdrop — role assignments
+  // are unaffected — but the failure is easier to read at boot than at the
+  // first approval.
+  try {
+    const { value } = await connection.getTokenSupply(TGBP_MINT);
+    tgbpDecimals = value.decimals;
+
+    const adminAta = getAssociatedTokenAddressSync(TGBP_MINT, admin.publicKey);
+    const ataInfo = await connection.getAccountInfo(adminAta);
+
+    if (!ataInfo) {
+      logger.error(
+        { adminAta: adminAta.toBase58(), mint: TGBP_MINT.toBase58() },
+        `Admin tGBP token account does not exist — every airdrop will fail ` +
+          `(role assignments are unaffected). Send at least ${AIRDROP_TGBP_AMOUNT} ` +
+          `tGBP to ${adminAta.toBase58()}.`,
+      );
+      return;
+    }
+
+    const { value: balance } = await connection.getTokenAccountBalance(adminAta);
+    const available = Number(balance.uiAmountString ?? "0");
+
+    if (available < AIRDROP_TGBP_AMOUNT) {
+      logger.error(
+        { adminAta: adminAta.toBase58(), available, required: AIRDROP_TGBP_AMOUNT },
+        `Admin tGBP balance is below the ${AIRDROP_TGBP_AMOUNT} airdrop amount — ` +
+          "every airdrop will fail (role assignments are unaffected).",
+      );
+    } else {
+      logger.info(
+        { adminAta: adminAta.toBase58(), tgbp: available, decimals: tgbpDecimals },
+        "Admin tGBP balance",
+      );
+    }
+  } catch (err) {
+    logger.warn(
+      { err: describeError(err), mint: TGBP_MINT.toBase58() },
+      "tGBP airdrop preflight check failed",
+    );
   }
 }
 
@@ -941,6 +1087,7 @@ export {
   assignRole,
   removeRole,
   setPermission,
+  airdropTokens,
   buildInstruction,
   assignRoleIx,
   removeRoleIx,

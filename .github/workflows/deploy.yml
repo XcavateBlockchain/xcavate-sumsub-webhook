@@ -45,6 +45,11 @@ jobs:
             REJECTED_ROLE_ACTION=${{ vars.REJECTED_ROLE_ACTION }}
             FAUCET_SOL_AMOUNT=${{ vars.FAUCET_SOL_AMOUNT }}
             SUMSUB_SECRET=${{ secrets.SUMSUB_SECRET }}
+            TGBP_API_BASE_URL=${{ vars.TGBP_API_BASE_URL }}
+            TGBP_API_KEY=${{ secrets.TGBP_API_KEY }}
+            SUMSUB_APP_TOKEN=${{ secrets.SUMSUB_APP_TOKEN }}
+            SUMSUB_RECIPIENT_CLIENT_ID=${{ vars.SUMSUB_RECIPIENT_CLIENT_ID }}
+            SUMSUB_SHARE_TOKEN_TTL=${{ vars.SUMSUB_SHARE_TOKEN_TTL }}
             PORT=8005
             EOF
 

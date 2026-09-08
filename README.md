@@ -287,6 +287,17 @@ Notes:
   the role change has already landed and Sumsub's 200 ack is unaffected.
   Because it only fires when a role change actually happened, redelivered
   webhooks don't airdrop twice.
+- **Off-chain customer registration (best-effort).** Once the on-chain half
+  has confirmed, the service mints a Sumsub [Reusable KYC share
+  token](https://docs.sumsub.com/docs/reusable-kyc-via-api) for the applicant
+  (`POST /resources/accessTokens/shareToken`, `forClientId` = tgbp.io's
+  Sumsub client) and registers the user as a customer on tgbp.io
+  (`POST {TGBP_API_BASE_URL}/api/v1/customers`, `X-API-Key:
+  <TGBP_API_KEY>`), passing the share token so tgbp.io can pull the KYC data.
+  If it fails it is logged and dropped — the on-chain role is unaffected and
+  the webhook still acks 200. The step is skipped entirely unless
+  `TGBP_API_KEY`, `SUMSUB_APP_TOKEN` and `SUMSUB_RECIPIENT_CLIENT_ID` are all
+  set (flagged at boot).
 - The client is driven by [the IDL](src/idl/xcavate_whitelist.json): program id,
   discriminators, account ordering and signer/writable flags all come from that
   file. After a program upgrade, drop in the regenerated IDL.
@@ -335,6 +346,21 @@ FAUCET_SOL_AMOUNT=0
 # Sumsub webhook secret key. When set, every webhook is signature-verified.
 SUMSUB_SECRET=your-webhook-secret
 
+# tgbp.io customer registration — all three of the next variables must be
+# set for the step to run; otherwise it is skipped and flagged at boot.
+# tgbp.io API base URL (sandbox by default; https://api.tgbp.io for live)
+TGBP_API_BASE_URL=https://sandbox.tgbp.io
+# tgbp.io API key (sandbox keys are prefixed `tgbp_sandbox_`), sent as
+# `X-API-Key` — the server-to-server auth per the API reference
+TGBP_API_KEY=
+# Sumsub client (app) token for this service's Sumsub account — mints the
+# Reusable KYC share token
+SUMSUB_APP_TOKEN=
+# tgbp.io's Sumsub client ID — the `forClientId` (recipient) of the share token
+SUMSUB_RECIPIENT_CLIENT_ID=
+# Share-token TTL in seconds (default 1200)
+SUMSUB_SHARE_TOKEN_TTL=1200
+
 # Server port (default 8005)
 PORT=8005
 ```
@@ -351,6 +377,12 @@ Add these **repository secrets**: `SSH_HOST`, `SSH_USER`, `SSH_PORT`, `SSH_KEY`,
 `DEPLOY_DIR`, `ALCHEMY_API_KEY`, `ADMIN_PRIVATE_KEY`, `SUMSUB_SECRET`. Add
 `SOLANA_RPC_URL` as a secret too only if you're bypassing Alchemy — when it's
 set, it wins over `ALCHEMY_API_KEY`.
+
+Add these for **tgbp.io customer registration**: secret `TGBP_API_KEY` and
+secret `SUMSUB_APP_TOKEN`, plus repository variables
+`SUMSUB_RECIPIENT_CLIENT_ID` (and optionally `TGBP_API_BASE_URL` and
+`SUMSUB_SHARE_TOKEN_TTL`). Until all three of the key/token/client-id values
+are set, approvals are handled on-chain only and the gap is logged at boot.
 
 Optionally add these **repository variables**: `SOLANA_CLUSTER`,
 `REJECTED_ROLE_ACTION`, `FAUCET_SOL_AMOUNT`. Leaving them unset keeps the

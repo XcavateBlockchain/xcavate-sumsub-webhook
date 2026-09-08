@@ -102,6 +102,32 @@ const ADMIN_PRIVATE_KEY = process.env.ADMIN_PRIVATE_KEY || "";
 const SUMSUB_SECRET = process.env.SUMSUB_SECRET || "";
 const PORT = parseInt(process.env.PORT || "8005", 10);
 
+// ── tgbp.io customer registration & Sumsub share tokens ────────────────
+//
+// When an applicant is approved, after the on-chain role + airdrop have
+// confirmed, the webhook also registers them as a customer on tgbp.io.
+// tgbp.io pulls the KYC data through Sumsub Reusable KYC: this service
+// mints a share token for the applicant (our Sumsub client is the donor,
+// tgbp.io's Sumsub client is the recipient, named by
+// SUMSUB_RECIPIENT_CLIENT_ID) and hands the token to the registration call.
+// All three knobs must be set for the feature to run; otherwise approvals
+// are handled on-chain only and the gap is logged at boot.
+const TGBP_API_BASE_URL = (
+  process.env.TGBP_API_BASE_URL || "https://sandbox.tgbp.io"
+).replace(/\/+$/, "");
+const TGBP_API_KEY = process.env.TGBP_API_KEY || "";
+const SUMSUB_APP_TOKEN = process.env.SUMSUB_APP_TOKEN || "";
+const SUMSUB_RECIPIENT_CLIENT_ID =
+  process.env.SUMSUB_RECIPIENT_CLIENT_ID || "";
+const SUMSUB_SHARE_TOKEN_TTL_SECS =
+  parseInt(process.env.SUMSUB_SHARE_TOKEN_TTL || "1200", 10) || 1200;
+
+/** Feature switch — derived so a half-configured env can't produce a confusing 401 loop. */
+const TGBP_REGISTRATION_ENABLED =
+  TGBP_API_KEY !== "" &&
+  SUMSUB_APP_TOKEN !== "" &&
+  SUMSUB_RECIPIENT_CLIENT_ID !== "";
+
 /**
  * What to do when a user fails KYC and already holds the role.
  *  - "revoke" (default): keep the role account, flip its permission to
@@ -623,6 +649,140 @@ async function airdropTokens(user: PublicKey): Promise<string> {
   );
 }
 
+// ── tgbp.io customer registration ───────────────────────────────────────
+
+const SUMSUB_API_BASE = "https://api.sumsub.com";
+
+/**
+ * tgbp.io customer-registration endpoint.
+ *
+ * VERIFY AGAINST THE DOCS: the tgbp.io API reference (provided as a local
+ * HTML file) is not part of this repo, so the path and the body field names
+ * below are best-effort — the live sandbox answers unknown paths with a
+ * `{"error":{...}}` body (confirmed against https://sandbox.tgbp.io), so a
+ * wrong path is loud in the logs. Auth is the `X-API-Key` header, which the
+ * reference documents for server-to-server calls (JWT Bearer is the
+ * web/mobile flow only).
+ */
+const TGBP_CUSTOMERS_PATH = "/api/v1/customers";
+
+/**
+ * Mint a Reusable KYC share token for `applicantId`.
+ *
+ * Sumsub endpoint: `POST /resources/accessTokens/shareToken`, authenticated
+ * with the Sumsub client (app) token in the `Authorization` header — Sumsub's
+ * convention, no `Bearer` prefix. `forClientId` names tgbp.io's Sumsub
+ * client as the recipient; with that token tgbp.io can ingest the
+ * applicant's KYC data on its side.
+ * Docs: https://docs.sumsub.com/docs/reusable-kyc-via-api
+ */
+async function fetchSumsubShareToken(applicantId: string): Promise<string> {
+  const res = await fetch(`${SUMSUB_API_BASE}/resources/accessTokens/shareToken`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: SUMSUB_APP_TOKEN,
+    },
+    body: JSON.stringify({
+      applicantId,
+      forClientId: SUMSUB_RECIPIENT_CLIENT_ID,
+      ttlInSecs: SUMSUB_SHARE_TOKEN_TTL_SECS,
+    }),
+    signal: AbortSignal.timeout(30_000),
+  });
+
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(
+      `Sumsub share token request failed (${res.status}): ${text.slice(0, 500)}`,
+    );
+  }
+
+  const { token } = JSON.parse(text) as { token?: string };
+  if (!token) {
+    throw new Error("Sumsub share token response has no `token` field");
+  }
+  return token;
+}
+
+/**
+ * Register `wallet` as a customer on tgbp.io, handing over the Sumsub share
+ * token so tgbp.io can pull the KYC data (Reusable KYC via API).
+ */
+async function registerTgbpCustomer(
+  wallet: string,
+  applicantId: string,
+  levelName: string,
+  shareToken: string,
+): Promise<void> {
+  const res = await fetch(`${TGBP_API_BASE_URL}${TGBP_CUSTOMERS_PATH}`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": TGBP_API_KEY,
+    },
+    body: JSON.stringify({
+      wallet,
+      sumsubApplicantId: applicantId,
+      sumsubShareToken: shareToken,
+      kycLevel: levelName,
+    }),
+    signal: AbortSignal.timeout(30_000),
+  });
+
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(
+      `tgbp.io customer registration failed (${res.status}): ${text.slice(0, 500)}`,
+    );
+  }
+
+  logger.info({ wallet, applicantId }, "Customer registered on tgbp.io");
+}
+
+/**
+ * Best-effort: mint the share token, then register the customer. Run only
+ * after the on-chain role change has confirmed, and never allowed to fail
+ * the webhook — a failed registration is logged, and the customer can be
+ * created in the tgbp.io portal manually.
+ */
+async function registerTgbpCustomerBestEffort(
+  user: PublicKey,
+  applicantId: string | undefined,
+  levelName: string,
+): Promise<void> {
+  if (!TGBP_REGISTRATION_ENABLED) {
+    logger.debug(
+      { wallet: user.toBase58() },
+      "tgbp.io registration skipped — TGBP_API_KEY, SUMSUB_APP_TOKEN or " +
+        "SUMSUB_RECIPIENT_CLIENT_ID is not set",
+    );
+    return;
+  }
+
+  if (!applicantId) {
+    logger.warn(
+      { wallet: user.toBase58() },
+      "tgbp.io registration skipped — no applicantId in webhook payload",
+    );
+    return;
+  }
+
+  try {
+    const shareToken = await fetchSumsubShareToken(applicantId);
+    await registerTgbpCustomer(user.toBase58(), applicantId, levelName, shareToken);
+  } catch (err) {
+    logger.error(
+      {
+        err: describeError(err),
+        wallet: user.toBase58(),
+        applicantId,
+      },
+      "tgbp.io customer registration failed — the on-chain role is unaffected",
+    );
+  }
+}
+
 // ── Webhook processing ──────────────────────────────────────────────────
 
 async function processSumsubWebhook(body: SumsubPayload): Promise<void> {
@@ -678,6 +838,8 @@ async function processSumsubWebhook(body: SumsubPayload): Promise<void> {
   try {
     if (isApproved) {
       await handleApproved(user, role, roleName);
+      // Off-chain, best-effort: only once the on-chain half has confirmed.
+      await registerTgbpCustomerBestEffort(user, body.applicantId, levelName);
     } else {
       await handleRejected(user, role, roleName);
     }
@@ -1067,6 +1229,14 @@ const server = app.listen(PORT, () => {
         "Set it in production so forged requests cannot whitelist arbitrary wallets.",
     );
   }
+  if (!TGBP_REGISTRATION_ENABLED) {
+    logger.warn(
+      { baseUrl: TGBP_API_BASE_URL },
+      "tgbp.io customer registration is DISABLED — set TGBP_API_KEY, " +
+        "SUMSUB_APP_TOKEN and SUMSUB_RECIPIENT_CLIENT_ID to enable it. " +
+        "Approved users will still get their on-chain role and airdrop.",
+    );
+  }
   void preflight();
 });
 
@@ -1096,6 +1266,9 @@ export {
   roleAccountPda,
   adminPda,
   configPda,
+  fetchSumsubShareToken,
+  registerTgbpCustomer,
+  registerTgbpCustomerBestEffort,
   Role,
   AccessPermission,
   PROGRAM_ID,

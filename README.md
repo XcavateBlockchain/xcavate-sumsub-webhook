@@ -296,6 +296,10 @@ Notes:
   Sumsub client) and registers the user as a customer on tgbp.io
   (`POST {TGBP_API_BASE_URL}/api/v1/customers`, `X-API-Key:
   <TGBP_API_KEY>`), passing the share token so tgbp.io can pull the KYC data.
+  The Sumsub call is routed by the webhook payload's `sandboxMode` flag —
+  sandbox applicants go to `api.sandbox.sumsub.com`, production ones to
+  `api.sumsub.com` — so `SUMSUB_APP_TOKEN` must match the universe your KYC
+  flow runs in.
   If it fails it is logged and dropped — the on-chain role is unaffected and
   the webhook still acks 200. The step is skipped entirely unless
   `TGBP_API_KEY`, `SUMSUB_APP_TOKEN` and `SUMSUB_RECIPIENT_CLIENT_ID` are all

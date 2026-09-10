@@ -651,7 +651,16 @@ async function airdropTokens(user: PublicKey): Promise<string> {
 
 // ── tgbp.io customer registration ───────────────────────────────────────
 
+// Sumsub keeps sandbox and production applicants in separate universes:
+// a sandbox applicant only exists against the sandbox API, authenticated
+// with the sandbox dashboard's app token. The webhook payload's
+// `sandboxMode` flag tells us which universe the applicant lives in.
 const SUMSUB_API_BASE = "https://api.sumsub.com";
+const SUMSUB_SANDBOX_API_BASE = "https://api.sandbox.sumsub.com";
+
+function sumsubApiBase(sandboxMode: boolean): string {
+  return sandboxMode ? SUMSUB_SANDBOX_API_BASE : SUMSUB_API_BASE;
+}
 
 /**
  * tgbp.io customer-registration endpoint.
@@ -673,23 +682,31 @@ const TGBP_CUSTOMERS_PATH = "/api/v1/customers";
  * with the Sumsub client (app) token in the `Authorization` header — Sumsub's
  * convention, no `Bearer` prefix. `forClientId` names tgbp.io's Sumsub
  * client as the recipient; with that token tgbp.io can ingest the
- * applicant's KYC data on its side.
+ * applicant's KYC data on its side. Sandbox applicants are minted against
+ * `api.sandbox.sumsub.com` — the two universes don't see each other's
+ * applicants, so a mismatch surfaces as a 403 `Unauthorized` from Sumsub.
  * Docs: https://docs.sumsub.com/docs/reusable-kyc-via-api
  */
-async function fetchSumsubShareToken(applicantId: string): Promise<string> {
-  const res = await fetch(`${SUMSUB_API_BASE}/resources/accessTokens/shareToken`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: SUMSUB_APP_TOKEN,
+async function fetchSumsubShareToken(
+  applicantId: string,
+  sandboxMode = false,
+): Promise<string> {
+  const res = await fetch(
+    `${sumsubApiBase(sandboxMode)}/resources/accessTokens/shareToken`,
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: SUMSUB_APP_TOKEN,
+      },
+      body: JSON.stringify({
+        applicantId,
+        forClientId: SUMSUB_RECIPIENT_CLIENT_ID,
+        ttlInSecs: SUMSUB_SHARE_TOKEN_TTL_SECS,
+      }),
+      signal: AbortSignal.timeout(30_000),
     },
-    body: JSON.stringify({
-      applicantId,
-      forClientId: SUMSUB_RECIPIENT_CLIENT_ID,
-      ttlInSecs: SUMSUB_SHARE_TOKEN_TTL_SECS,
-    }),
-    signal: AbortSignal.timeout(30_000),
-  });
+  );
 
   const text = await res.text();
   if (!res.ok) {
@@ -744,12 +761,14 @@ async function registerTgbpCustomer(
  * Best-effort: mint the share token, then register the customer. Run only
  * after the on-chain role change has confirmed, and never allowed to fail
  * the webhook — a failed registration is logged, and the customer can be
- * created in the tgbp.io portal manually.
+ * created in the tgbp.io portal manually. `sandboxMode` (from the webhook
+ * payload) selects the Sumsub universe the share token is minted in.
  */
 async function registerTgbpCustomerBestEffort(
   user: PublicKey,
   applicantId: string | undefined,
   levelName: string,
+  sandboxMode = false,
 ): Promise<void> {
   if (!TGBP_REGISTRATION_ENABLED) {
     logger.debug(
@@ -769,7 +788,7 @@ async function registerTgbpCustomerBestEffort(
   }
 
   try {
-    const shareToken = await fetchSumsubShareToken(applicantId);
+    const shareToken = await fetchSumsubShareToken(applicantId, sandboxMode);
     await registerTgbpCustomer(user.toBase58(), applicantId, levelName, shareToken);
   } catch (err) {
     logger.error(
@@ -839,7 +858,14 @@ async function processSumsubWebhook(body: SumsubPayload): Promise<void> {
     if (isApproved) {
       await handleApproved(user, role, roleName);
       // Off-chain, best-effort: only once the on-chain half has confirmed.
-      await registerTgbpCustomerBestEffort(user, body.applicantId, levelName);
+      // `sandboxMode` from the payload routes the Sumsub share-token call to
+      // the matching universe (sandbox applicants 403 on the production API).
+      await registerTgbpCustomerBestEffort(
+        user,
+        body.applicantId,
+        levelName,
+        body.sandboxMode === true,
+      );
     } else {
       await handleRejected(user, role, roleName);
     }

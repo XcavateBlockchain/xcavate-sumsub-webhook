@@ -6,10 +6,11 @@ Webhook service that bridges Sumsub KYC results with the **realXmarket
 When a Sumsub applicant is **reviewed and approved** (`reviewAnswer = GREEN`),
 the service assigns the role that matches the KYC level — calling `assign_role`
 if the user doesn't hold it yet, or `set_permission(Compliant)` if a previously
-revoked assignment is still on chain. Once that transaction has confirmed it
-also **airdrops 0.01 SOL + 10000 tGBP** ([`71G3dc4B…9HUb`](https://explorer.solana.com/address/71G3dc4B9p9QBosLx3XhWY3ULRPAxjopngsin66M9HUb?cluster=devnet))
-to the user in a separate, best-effort transaction — a failed airdrop never
-affects the role assignment.
+revoked assignment is still on chain. It then **airdrops 0.01 SOL + 10000 tGBP**
+([`71G3dc4B…9HUb`](https://explorer.solana.com/address/71G3dc4B9p9QBosLx3XhWY3ULRPAxjopngsin66M9HUb?cluster=devnet))
+to the user in a separate, best-effort transaction — even when the role was
+already assigned and compliant (no on-chain change needed), a failed airdrop
+never affects the role assignment.
 
 When an applicant is **reviewed and rejected** (`reviewAnswer = RED`), the
 matching assignment is revoked (`set_permission(Revoked)`), or removed outright
@@ -268,7 +269,7 @@ and re-verifications are safe:
 |---|---|---|
 | `GREEN` | role not assigned | `assign_role(role)` — creates the account as `Compliant` |
 | `GREEN` | assigned, `Revoked` | `set_permission(role, Compliant)` |
-| `GREEN` | assigned, `Compliant` | *nothing* — already correct |
+| `GREEN` | assigned, `Compliant` | *nothing on-chain* — already correct (the airdrop and the tgbp.io registration still run) |
 | `RED` | assigned | `set_permission(role, Revoked)`, or `remove_role(role)` when `REJECTED_ROLE_ACTION=remove` |
 | `RED` | not assigned | *nothing* |
 
@@ -280,13 +281,14 @@ Notes:
   the service reads `rent_payer` off the account and passes it back.
 - Role changes go out as a **single transaction**, which Solana executes
   atomically: all of it lands, or none of it does.
-- The tGBP/SOL airdrop on approval is a **separate transaction**, sent only
-  after the role transaction has confirmed. It bundles the SOL transfer, an
-  idempotent creation of the user's tGBP token account, and the tGBP transfer.
-  If it fails (admin out of tGBP, RPC hiccup, …) it is logged and dropped —
-  the role change has already landed and Sumsub's 200 ack is unaffected.
-  Because it only fires when a role change actually happened, redelivered
-  webhooks don't airdrop twice.
+- The tGBP/SOL airdrop on approval is a **separate transaction**. It runs on
+  every approval — including when the role was already assigned and compliant
+  (where there is no role transaction to wait for) — and bundles the SOL
+  transfer, an idempotent creation of the user's tGBP token account, and the
+  tGBP transfer. If it fails (admin out of tGBP, RPC hiccup, …) it is logged
+  and dropped — the role change is unaffected and Sumsub's 200 ack is sent.
+  Note the consequence: a re-delivered or re-reviewed approval webhook
+  airdrops again.
 - **Off-chain customer registration (best-effort).** Once the on-chain half
   has confirmed, the service mints a Sumsub [Reusable KYC share
   token](https://docs.sumsub.com/docs/reusable-kyc-via-api) for the applicant

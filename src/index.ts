@@ -854,9 +854,12 @@ async function processSumsubWebhook(body: SumsubPayload): Promise<void> {
 /**
  * Approved: make sure the user holds the mapped role and is marked
  * Compliant — optionally with an extra SOL drip riding in the same
- * transaction so they land together or not at all. Then, once that
- * transaction has confirmed, airdrop 0.01 SOL + 10000 tGBP in a separate
- * best-effort transaction (see `airdropTokens`).
+ * transaction so they land together or not at all. Then airdrop 0.01 SOL +
+ * 10000 tGBP in a separate best-effort transaction (see `airdropTokens`).
+ * The airdrop runs even when there was nothing to change on-chain (the role
+ * was already assigned and compliant), so a repeated approval webhook still
+ * pays out; the tgbp.io customer registration that follows in
+ * processSumsubWebhook runs as well.
  */
 async function handleApproved(
   user: PublicKey,
@@ -864,6 +867,7 @@ async function handleApproved(
   roleName: string | null,
 ): Promise<void> {
   const instructions: TransactionInstruction[] = [];
+  let alreadyCompliant = false;
 
   if (role === undefined) {
     logger.warn(
@@ -882,9 +886,11 @@ async function handleApproved(
       // compliance flag back instead.
       instructions.push(setPermissionIx(user, role, AccessPermission.Compliant));
     } else {
+      alreadyCompliant = true;
       logger.info(
         { user: user.toBase58(), role: roleName },
-        "Role already assigned and compliant, nothing to do",
+        "Role already assigned and compliant — no on-chain change needed; " +
+          "airdrop and tgbp.io registration still run",
       );
     }
   }
@@ -899,13 +905,21 @@ async function handleApproved(
     );
   }
 
-  if (instructions.length === 0) return;
+  // Nothing to do on-chain and the role is not already compliant (i.e. the
+  // KYC level has no mapped role and there is no faucet transfer) — preserve
+  // the old no-op behavior. The tgbp.io registration still runs afterwards
+  // in processSumsubWebhook.
+  if (instructions.length === 0 && !alreadyCompliant) return;
 
-  const signature = await submitTransaction(instructions, "approved");
+  const signature =
+    instructions.length === 0
+      ? undefined
+      : await submitTransaction(instructions, "approved");
 
-  // Best-effort airdrop in its own transaction: the role change has already
-  // confirmed, so a failure here is logged and dropped — it cannot roll the
-  // assignment back or surface as a webhook error.
+  // Best-effort airdrop in its own transaction. It runs even when there was
+  // no on-chain change (the role was already compliant); a failure is
+  // logged and dropped — it cannot roll the assignment back or surface as a
+  // webhook error.
   try {
     const airdropSignature = await airdropTokens(user);
     logger.info(
@@ -916,7 +930,9 @@ async function handleApproved(
         signature,
         airdropSignature,
       },
-      "Approved flow executed",
+      signature
+        ? "Approved flow executed"
+        : "Role already compliant — airdrop executed anyway",
     );
   } catch (err) {
     logger.error(
@@ -926,7 +942,9 @@ async function handleApproved(
         role: roleName,
         signature,
       },
-      "Airdrop failed — the role assignment already confirmed and is unaffected",
+      signature
+        ? "Airdrop failed — the role assignment already confirmed and is unaffected"
+        : "Airdrop failed — role was already assigned and compliant",
     );
   }
 }

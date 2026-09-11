@@ -518,7 +518,15 @@ function setPermissionIx(
 function describeError(err: unknown): string {
   // Redacted: transport errors quote the endpoint they failed on, which
   // carries the Alchemy API key.
-  const message = redactSecrets(err instanceof Error ? err.message : String(err));
+  let message = redactSecrets(err instanceof Error ? err.message : String(err));
+  // Node's fetch (undici) wraps network-level failures (DNS, TCP, TLS) in a
+  // bare `fetch failed`; the real reason — ENOTFOUND, ECONNRESET, a timeout —
+  // only lives in `cause`, so append it or the log is a dead end.
+  const cause = (err as { cause?: unknown } | null)?.cause;
+  if (cause instanceof Error && cause.message) {
+    const code = (cause as { code?: string }).code;
+    message += redactSecrets(` (cause: ${code ? `${code} — ` : ""}${cause.message})`);
+  }
   const match = message.match(/custom program error: (0x[0-9a-fA-F]+)/);
   if (match) {
     const code = parseInt(match[1], 16);
@@ -665,13 +673,13 @@ function sumsubApiBase(sandboxMode: boolean): string {
 /**
  * tgbp.io customer-registration endpoint.
  *
- * VERIFY AGAINST THE DOCS: the tgbp.io API reference (provided as a local
- * HTML file) is not part of this repo, so the path and the body field names
- * below are best-effort — the live sandbox answers unknown paths with a
- * `{"error":{...}}` body (confirmed against https://sandbox.tgbp.io), so a
- * wrong path is loud in the logs. Auth is the `X-API-Key` header, which the
- * reference documents for server-to-server calls (JWT Bearer is the
- * web/mobile flow only).
+ * Confirmed against the tgbp.io API reference (local HTML copy): the body is
+ * a `CustomerCreateRequest` where `type: "individual"` is the required
+ * discriminator and the individual variant needs an `email` plus either a
+ * `name` or both `first_name` and `last_name`. The Sumsub field is the
+ * snake_case `sumsub_share_token` (tgbp.io ingests the KYC data from Sumsub
+ * itself once it has the token); there is no wallet field in the create
+ * body. Auth is the `x-api-key` header for server-to-server calls.
  */
 const TGBP_CUSTOMERS_PATH = "/api/v1/customers";
 
@@ -722,28 +730,97 @@ async function fetchSumsubShareToken(
   return token;
 }
 
+/** KYC applicant details we need for the tgbp.io customer body. */
+interface ApplicantDetails {
+  email?: string;
+  firstName?: string;
+  lastName?: string;
+}
+
 /**
- * Register `wallet` as a customer on tgbp.io, handing over the Sumsub share
- * token so tgbp.io can pull the KYC data (Reusable KYC via API).
+ * Fetch the applicant's contact details from the Sumsub Resource API. The
+ * `applicantReviewed` webhook payload doesn't carry them, and the tgbp.io
+ * create body needs an email (plus a name) on top of the share token. Same
+ * raw app-token auth as the share-token mint. The exact resource path isn't
+ * pinned in the docs I have, so a 404 falls through to the older path
+ * convention before giving up.
+ */
+async function fetchSumsubApplicantDetails(
+  applicantId: string,
+  sandboxMode = false,
+): Promise<ApplicantDetails> {
+  const base = sumsubApiBase(sandboxMode);
+  const paths = [
+    `/resources/applicants/${applicantId}`,
+    `/applicants/${applicantId}`,
+  ];
+
+  for (const path of paths) {
+    const res = await fetch(`${base}${path}`, {
+      headers: { authorization: SUMSUB_APP_TOKEN },
+      signal: AbortSignal.timeout(30_000),
+    });
+
+    const text = await res.text();
+    if (res.status === 404) continue;
+    if (!res.ok) {
+      throw new Error(
+        `Sumsub applicant details request failed (${res.status} on ${path}): ${text.slice(0, 300)}`,
+      );
+    }
+
+    const data = JSON.parse(text) as Record<string, unknown>;
+    const pick = (...keys: string[]): string | undefined => {
+      for (const key of keys) {
+        const value = data[key];
+        if (typeof value === "string" && value.trim()) return value.trim();
+      }
+      return undefined;
+    };
+    return {
+      email: pick("email", "eMail"),
+      firstName: pick("firstName", "first_name"),
+      lastName: pick("lastName", "last_name"),
+    };
+  }
+
+  throw new Error(
+    `Sumsub applicant details not found — 404 on every path for ${applicantId}`,
+  );
+}
+
+/**
+ * Register the KYC'd applicant as a customer on tgbp.io. The body follows
+ * the `CustomerCreateRequest` from the tgbp.io API reference: `type`
+ * discriminates the variant, individuals need an `email` plus either a
+ * `name` or both `first_name` and `last_name`, and the snake_case
+ * `sumsub_share_token` lets tgbp.io pull the KYC data from Sumsub itself.
+ * There is no wallet field.
  */
 async function registerTgbpCustomer(
-  wallet: string,
-  applicantId: string,
-  levelName: string,
+  details: { email: string; firstName?: string; lastName?: string },
   shareToken: string,
 ): Promise<void> {
+  const body: Record<string, string> = {
+    type: "individual",
+    email: details.email,
+    sumsub_share_token: shareToken,
+  };
+  if (details.firstName && details.lastName) {
+    body.first_name = details.firstName;
+    body.last_name = details.lastName;
+  } else {
+    const single = details.firstName ?? details.lastName;
+    if (single) body.name = single;
+  }
+
   const res = await fetch(`${TGBP_API_BASE_URL}${TGBP_CUSTOMERS_PATH}`, {
     method: "POST",
     headers: {
       "content-type": "application/json",
       "x-api-key": TGBP_API_KEY,
     },
-    body: JSON.stringify({
-      wallet,
-      sumsubApplicantId: applicantId,
-      sumsubShareToken: shareToken,
-      kycLevel: levelName,
-    }),
+    body: JSON.stringify(body),
     signal: AbortSignal.timeout(30_000),
   });
 
@@ -754,20 +831,28 @@ async function registerTgbpCustomer(
     );
   }
 
-  logger.info({ wallet, applicantId }, "Customer registered on tgbp.io");
+  let customerId: string | null = null;
+  try {
+    const parsed = JSON.parse(text) as { id?: unknown };
+    if (typeof parsed.id === "string") customerId = parsed.id;
+  } catch {
+    // Non-JSON success body — the 2xx status is all we need.
+  }
+  logger.info({ customerId }, "Customer registered on tgbp.io");
 }
 
 /**
- * Best-effort: mint the share token, then register the customer. Run only
- * after the on-chain role change has confirmed, and never allowed to fail
- * the webhook — a failed registration is logged, and the customer can be
- * created in the tgbp.io portal manually. `sandboxMode` (from the webhook
- * payload) selects the Sumsub universe the share token is minted in.
+ * Best-effort: fetch the applicant's details, mint the share token, then
+ * register the customer. Run only after the on-chain role change has
+ * confirmed, and never allowed to fail the webhook — a failed registration
+ * is logged, and the customer can be created in the tgbp.io portal manually.
+ * `sandboxMode` (from the webhook payload) selects the Sumsub universe the
+ * share token is minted in.
  */
 async function registerTgbpCustomerBestEffort(
   user: PublicKey,
   applicantId: string | undefined,
-  levelName: string,
+  _levelName: string,
   sandboxMode = false,
 ): Promise<void> {
   if (!TGBP_REGISTRATION_ENABLED) {
@@ -788,8 +873,20 @@ async function registerTgbpCustomerBestEffort(
   }
 
   try {
+    const details = await fetchSumsubApplicantDetails(applicantId, sandboxMode);
+    const email = details.email;
+    if (!email) {
+      logger.warn(
+        { wallet: user.toBase58(), applicantId },
+        "tgbp.io registration skipped — the Sumsub applicant has no email address",
+      );
+      return;
+    }
     const shareToken = await fetchSumsubShareToken(applicantId, sandboxMode);
-    await registerTgbpCustomer(user.toBase58(), applicantId, levelName, shareToken);
+    await registerTgbpCustomer(
+      { email, firstName: details.firstName, lastName: details.lastName },
+      shareToken,
+    );
   } catch (err) {
     logger.error(
       {
@@ -1310,6 +1407,7 @@ export {
   roleAccountPda,
   adminPda,
   configPda,
+  fetchSumsubApplicantDetails,
   fetchSumsubShareToken,
   registerTgbpCustomer,
   registerTgbpCustomerBestEffort,

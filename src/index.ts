@@ -799,12 +799,12 @@ async function fetchSumsubApplicantDetails(
  */
 async function registerTgbpCustomer(
   details: { email: string; firstName?: string; lastName?: string },
-  shareToken: string,
+  _shareToken: string,
 ): Promise<void> {
   const body: Record<string, string> = {
     type: "individual",
     email: details.email,
-    sumsub_share_token: shareToken,
+    //sumsub_share_token: shareToken,
   };
   if (details.firstName && details.lastName) {
     body.first_name = details.firstName;

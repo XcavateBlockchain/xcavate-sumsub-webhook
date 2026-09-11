@@ -296,14 +296,16 @@ Notes:
   Sumsub client) and registers the user as a customer on tgbp.io
   (`POST {TGBP_API_BASE_URL}/api/v1/customers`, `X-API-Key:
   <TGBP_API_KEY>`), passing the share token so tgbp.io can pull the KYC data.
-  The Sumsub call is routed by the webhook payload's `sandboxMode` flag —
-  sandbox applicants go to `api.sandbox.sumsub.com`, production ones to
-  `api.sumsub.com` — so `SUMSUB_APP_TOKEN` must match the universe your KYC
-  flow runs in.
+  Both universes use the single host `api.sumsub.com` — `SUMSUB_APP_TOKEN`
+  itself selects which one, so it must be created in the same universe your
+  KYC flow runs in (a cross-universe token fails). The token must also be
+  created with the **"Share applicants data"** permission checked (Reusable
+  Identity group), otherwise the share-token call fails with
+  `403 "User not authorized"` — see [Troubleshooting](#troubleshooting).
   If it fails it is logged and dropped — the on-chain role is unaffected and
   the webhook still acks 200. The step is skipped entirely unless
-  `TGBP_API_KEY`, `SUMSUB_APP_TOKEN` and `SUMSUB_RECIPIENT_CLIENT_ID` are all
-  set (flagged at boot).
+  `TGBP_API_KEY`, `SUMSUB_APP_TOKEN`, `SUMSUB_APP_TOKEN_SECRET` and
+  `SUMSUB_RECIPIENT_CLIENT_ID` are all set (flagged at boot).
 - The client is driven by [the IDL](src/idl/xcavate_whitelist.json): program id,
   discriminators, account ordering and signer/writable flags all come from that
   file. After a program upgrade, drop in the regenerated IDL.
@@ -352,7 +354,7 @@ FAUCET_SOL_AMOUNT=0
 # Sumsub webhook secret key. When set, every webhook is signature-verified.
 SUMSUB_SECRET=your-webhook-secret
 
-# tgbp.io customer registration — all three of the next variables must be
+# tgbp.io customer registration — all four of the next variables must be
 # set for the step to run; otherwise it is skipped and flagged at boot.
 # tgbp.io API base URL (sandbox by default; https://api.tgbp.io for live)
 TGBP_API_BASE_URL=https://sandbox.tgbp.io
@@ -360,8 +362,13 @@ TGBP_API_BASE_URL=https://sandbox.tgbp.io
 # `X-API-Key` — the server-to-server auth per the API reference
 TGBP_API_KEY=
 # Sumsub client (app) token for this service's Sumsub account — mints the
-# Reusable KYC share token
+# Reusable KYC share token. Must be created with the "Share applicants
+# data" permission checked (403 "User not authorized" otherwise), and the
+# permission cannot be added to an existing token afterwards
 SUMSUB_APP_TOKEN=
+# HMAC secret key generated alongside the app token above (shown once) —
+# Sumsub API calls are signed with it via the X-App-Access-Sig header
+SUMSUB_APP_TOKEN_SECRET=
 # tgbp.io's Sumsub client ID — the `forClientId` (recipient) of the share token
 SUMSUB_RECIPIENT_CLIENT_ID=
 # Share-token TTL in seconds (default 1200)
@@ -384,11 +391,12 @@ Add these **repository secrets**: `SSH_HOST`, `SSH_USER`, `SSH_PORT`, `SSH_KEY`,
 `SOLANA_RPC_URL` as a secret too only if you're bypassing Alchemy — when it's
 set, it wins over `ALCHEMY_API_KEY`.
 
-Add these for **tgbp.io customer registration**: secret `TGBP_API_KEY` and
-secret `SUMSUB_APP_TOKEN`, plus repository variables
-`SUMSUB_RECIPIENT_CLIENT_ID` (and optionally `TGBP_API_BASE_URL` and
-`SUMSUB_SHARE_TOKEN_TTL`). Until all three of the key/token/client-id values
-are set, approvals are handled on-chain only and the gap is logged at boot.
+Add these for **tgbp.io customer registration**: secrets `TGBP_API_KEY`,
+`SUMSUB_APP_TOKEN`, `SUMSUB_APP_TOKEN_SECRET` and
+`SUMSUB_RECIPIENT_CLIENT_ID` (plus optional repository variables
+`TGBP_API_BASE_URL` and `SUMSUB_SHARE_TOKEN_TTL`). Until all four of the
+key/token/secret/client-id values are set, approvals are handled on-chain
+only and the gap is logged at boot.
 
 Optionally add these **repository variables**: `SOLANA_CLUSTER`,
 `REJECTED_ROLE_ACTION`, `FAUCET_SOL_AMOUNT`. Leaving them unset keeps the
@@ -443,3 +451,4 @@ solana program show 7TrzjKpdrEhnfhxuw8tWdH1sjxadazscsG5HXCDPLmaY --url devnet
 | `PermissionAlreadySet` (6001) | The permission is already at the requested value — harmless, and normally avoided by the read-before-write |
 | `WrongRentPayer` (6005) | `remove_role` was sent with a `rent_payer` other than the one stored on the role account |
 | Nothing happens on approval | The webhook isn't subscribed to `applicantReviewed`, or the target URL isn't reachable over HTTPS |
+| `Sumsub share token request failed (403 "User not authorized")` | The `SUMSUB_APP_TOKEN` role lacks the **"Share applicants data"** permission (Reusable Identity group) — the token authenticates (the applicant-details call works) but isn't allowed to mint share tokens. [App token permissions are fixed at creation](https://docs.sumsub.com/docs/app-tokens) and cannot be edited: generate a **new** app token (same mode as your KYC flow — sandbox/production) with that permission checked, update the `SUMSUB_APP_TOKEN` / `SUMSUB_APP_TOKEN_SECRET` secrets and redeploy. Also verify the donor↔tgbp.io partner connection exists in the same environment (Sumsub Dashboard → Reusable identity → Partners) |

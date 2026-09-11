@@ -744,7 +744,16 @@ async function sumsubFetch(
  * tgbp.io's Sumsub client as the recipient; with that token tgbp.io can
  * ingest the applicant's KYC data on its side. Sandbox and production share
  * the same host — the app token itself selects the universe.
- * Docs: https://docs.sumsub.com/sumsub/reference/authentication
+ *
+ * Permission: the app token's role must include the "Share applicants data"
+ * dashboard permission (Reusable Identity group). Without it Sumsub answers
+ * 403 "User not authorized" — a permission error, not a signing failure
+ * (a bad signature or unknown token is a 401, and Reusable-KYC domain
+ * errors carry an `errorCode`, which this response does not). Token
+ * permissions are fixed at creation and cannot be edited afterwards, so the
+ * remedy is a freshly generated token — the 403 branch below says so in the
+ * log.
+ * Docs: https://docs.sumsub.com/reference/generate-share-token
  */
 async function fetchSumsubShareToken(applicantId: string): Promise<string> {
   const res = await sumsubFetch("POST", "/resources/accessTokens/shareToken", {
@@ -755,6 +764,19 @@ async function fetchSumsubShareToken(applicantId: string): Promise<string> {
 
   const text = await res.text();
   if (!res.ok) {
+    if (res.status === 403) {
+      throw new Error(
+        `Sumsub share token request failed (403 "User not authorized"): ` +
+          `the SUMSUB_APP_TOKEN role does not have the "Share applicants data" ` +
+          `permission (Reusable Identity group), which this endpoint requires. ` +
+          `App token permissions are fixed at creation and cannot be changed ` +
+          `afterwards — generate a NEW app token in the Sumsub Dashboard ` +
+          `(Dev space → App Tokens → Generate app token, in the same mode your ` +
+          `KYC flow runs in) with "Share applicants data" checked, then update ` +
+          `the SUMSUB_APP_TOKEN and SUMSUB_APP_TOKEN_SECRET secrets and redeploy. ` +
+          `Sumsub response: ${text.slice(0, 300)}`,
+      );
+    }
     throw new Error(
       `Sumsub share token request failed (${res.status}): ${text.slice(0, 500)}`,
     );

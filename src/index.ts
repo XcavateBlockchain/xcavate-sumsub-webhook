@@ -117,15 +117,22 @@ const TGBP_API_BASE_URL = (
 ).replace(/\/+$/, "");
 const TGBP_API_KEY = process.env.TGBP_API_KEY || "";
 const SUMSUB_APP_TOKEN = process.env.SUMSUB_APP_TOKEN || "";
+const SUMSUB_APP_TOKEN_SECRET = process.env.SUMSUB_APP_TOKEN_SECRET || "";
 const SUMSUB_RECIPIENT_CLIENT_ID =
   process.env.SUMSUB_RECIPIENT_CLIENT_ID || "";
 const SUMSUB_SHARE_TOKEN_TTL_SECS =
   parseInt(process.env.SUMSUB_SHARE_TOKEN_TTL || "1200", 10) || 1200;
 
-/** Feature switch — derived so a half-configured env can't produce a confusing 401 loop. */
+/**
+ * Feature switch — derived so a half-configured env can't produce a
+ * confusing 401/403 loop. SUMSUB_APP_TOKEN_SECRET is the secret key Sumsub
+ * shows alongside the app token when it is created; every Sumsub API request
+ * is signed with it, so the token alone is not enough to call the API.
+ */
 const TGBP_REGISTRATION_ENABLED =
   TGBP_API_KEY !== "" &&
   SUMSUB_APP_TOKEN !== "" &&
+  SUMSUB_APP_TOKEN_SECRET !== "" &&
   SUMSUB_RECIPIENT_CLIENT_ID !== "";
 
 /**
@@ -680,33 +687,71 @@ const SUMSUB_API_BASE = "https://api.sumsub.com";
 const TGBP_CUSTOMERS_PATH = "/api/v1/customers";
 
 /**
+ * Make a signed request against the Sumsub Resource API.
+ *
+ * Sumsub does not accept the raw app token in the `Authorization` header —
+ * that is exactly what produces the `403 "Unauthorized (cfb)"` response.
+ * Every request must carry three headers instead:
+ *
+ * - `X-App-Token` — the app token itself
+ * - `X-App-Access-Ts` — unix timestamp in seconds (UTC), must be within a
+ *   minute of Sumsub's server time
+ * - `X-App-Access-Sig` — HMAC-SHA256, lowercase hex, keyed with the app
+ *   token's SECRET KEY (SUMSUB_APP_TOKEN_SECRET) over the concatenation
+ *   `timestamp + METHOD (uppercase) + /path(+query) + body`. `body` is the
+ *   exact byte sequence sent — the empty string for GET.
+ *
+ * Docs: https://docs.sumsub.com/sumsub/reference/authentication
+ *
+ * The signed message is built from the same `body` string that is sent, so
+ * signature and wire bytes match by construction.
+ */
+// Return type is inferred (global fetch Response): an explicit `Response`
+// annotation would resolve to the Express type imported at the top of this
+// file.
+async function sumsubFetch(
+  method: "GET" | "POST",
+  path: string,
+  bodyObj?: unknown,
+) {
+  const body = bodyObj === undefined ? "" : JSON.stringify(bodyObj);
+  const ts = Math.floor(Date.now() / 1000);
+  const sig = crypto
+    .createHmac("sha256", SUMSUB_APP_TOKEN_SECRET)
+    .update(`${ts}${method}${path}${body}`)
+    .digest("hex");
+
+  const headers: Record<string, string> = {
+    "X-App-Token": SUMSUB_APP_TOKEN,
+    "X-App-Access-Ts": String(ts),
+    "X-App-Access-Sig": sig,
+  };
+  if (body) headers["content-type"] = "application/json";
+
+  return fetch(`${SUMSUB_API_BASE}${path}`, {
+    method,
+    headers,
+    body: body || undefined,
+    signal: AbortSignal.timeout(30_000),
+  });
+}
+
+/**
  * Mint a Reusable KYC share token for `applicantId`.
  *
  * Sumsub endpoint: `POST /resources/accessTokens/shareToken`, authenticated
- * with the Sumsub client (app) token in the `Authorization` header — Sumsub's
- * convention, no `Bearer` prefix. `forClientId` names tgbp.io's Sumsub
- * client as the recipient; with that token tgbp.io can ingest the
- * applicant's KYC data on its side. Sandbox and production share the same
- * host — the app token itself selects the universe.
- * Docs: https://docs.sumsub.com/docs/reusable-kyc-via-api
+ * with the signed header scheme (see `sumsubFetch`). `forClientId` names
+ * tgbp.io's Sumsub client as the recipient; with that token tgbp.io can
+ * ingest the applicant's KYC data on its side. Sandbox and production share
+ * the same host — the app token itself selects the universe.
+ * Docs: https://docs.sumsub.com/sumsub/reference/authentication
  */
 async function fetchSumsubShareToken(applicantId: string): Promise<string> {
-  const res = await fetch(
-    `${SUMSUB_API_BASE}/resources/accessTokens/shareToken`,
-    {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: SUMSUB_APP_TOKEN,
-      },
-      body: JSON.stringify({
-        applicantId,
-        forClientId: SUMSUB_RECIPIENT_CLIENT_ID,
-        ttlInSecs: SUMSUB_SHARE_TOKEN_TTL_SECS,
-      }),
-      signal: AbortSignal.timeout(30_000),
-    },
-  );
+  const res = await sumsubFetch("POST", "/resources/accessTokens/shareToken", {
+    applicantId,
+    forClientId: SUMSUB_RECIPIENT_CLIENT_ID,
+    ttlInSecs: SUMSUB_SHARE_TOKEN_TTL_SECS,
+  });
 
   const text = await res.text();
   if (!res.ok) {
@@ -732,52 +777,41 @@ interface ApplicantDetails {
 /**
  * Fetch the applicant's contact details from the Sumsub Resource API. The
  * `applicantReviewed` webhook payload doesn't carry them, and the tgbp.io
- * create body needs an email (plus a name) on top of the share token. Same
- * raw app-token auth as the share-token mint. The exact resource path isn't
- * pinned in the docs I have, so a 404 falls through to the older path
- * convention before giving up.
+ * create body needs an email (plus a name) on top of the share token.
+ * Endpoint: `GET /resources/applicants/{id}/one`, authenticated with the
+ * signed header scheme (see `sumsubFetch`). In the response the email sits
+ * at the root level while the names are nested under `fixedInfo` (`info`
+ * as fallback).
  */
 async function fetchSumsubApplicantDetails(
   applicantId: string,
 ): Promise<ApplicantDetails> {
-  const base = SUMSUB_API_BASE;
-  const paths = [
-    `/resources/applicants/${applicantId}`,
-    `/applicants/${applicantId}`,
-  ];
+  const path = `/resources/applicants/${applicantId}/one`;
+  const res = await sumsubFetch("GET", path);
 
-  for (const path of paths) {
-    const res = await fetch(`${base}${path}`, {
-      headers: { authorization: SUMSUB_APP_TOKEN },
-      signal: AbortSignal.timeout(30_000),
-    });
-
-    const text = await res.text();
-    if (res.status === 404) continue;
-    if (!res.ok) {
-      throw new Error(
-        `Sumsub applicant details request failed (${res.status} on ${path}): ${text.slice(0, 300)}`,
-      );
-    }
-
-    const data = JSON.parse(text) as Record<string, unknown>;
-    const pick = (...keys: string[]): string | undefined => {
-      for (const key of keys) {
-        const value = data[key];
-        if (typeof value === "string" && value.trim()) return value.trim();
-      }
-      return undefined;
-    };
-    return {
-      email: pick("email", "eMail"),
-      firstName: pick("firstName", "first_name"),
-      lastName: pick("lastName", "last_name"),
-    };
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(
+      `Sumsub applicant details request failed (${res.status} on ${path}): ${text.slice(0, 300)}`,
+    );
   }
 
-  throw new Error(
-    `Sumsub applicant details not found — 404 on every path for ${applicantId}`,
-  );
+  const data = JSON.parse(text) as {
+    email?: unknown;
+    fixedInfo?: Record<string, unknown>;
+    info?: Record<string, unknown>;
+  };
+  const pick = (...values: unknown[]): string | undefined => {
+    for (const value of values) {
+      if (typeof value === "string" && value.trim()) return value.trim();
+    }
+    return undefined;
+  };
+  return {
+    email: pick(data.email),
+    firstName: pick(data.fixedInfo?.firstName, data.info?.firstName),
+    lastName: pick(data.fixedInfo?.lastName, data.info?.lastName),
+  };
 }
 
 /**
@@ -1363,7 +1397,8 @@ const server = app.listen(PORT, () => {
     logger.warn(
       { baseUrl: TGBP_API_BASE_URL },
       "tgbp.io customer registration is DISABLED — set TGBP_API_KEY, " +
-        "SUMSUB_APP_TOKEN and SUMSUB_RECIPIENT_CLIENT_ID to enable it. " +
+        "SUMSUB_APP_TOKEN, SUMSUB_APP_TOKEN_SECRET and " +
+        "SUMSUB_RECIPIENT_CLIENT_ID to enable it. " +
         "Approved users will still get their on-chain role and airdrop.",
     );
   }

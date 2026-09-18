@@ -778,7 +778,7 @@ async function fetchSumsubShareToken(applicantId: string): Promise<string> {
       );
     }
     throw new Error(
-      `Sumsub share token request failed (${res.status}): ${text.slice(0, 500)}`,
+      `Sumsub share token request failed (${res.status}): ${text.slice(0, 20000)}`,
     );
   }
 
@@ -920,7 +920,7 @@ async function registerTgbpCustomer(
       );
     }
     throw new Error(
-      `tgbp.io customer registration failed (${res.status}): ${text.slice(0, 500)}${fieldErrors}`,
+      `tgbp.io customer registration failed (${res.status}): ${text.slice(0, 20000)}${fieldErrors}`,
     );
   }
 

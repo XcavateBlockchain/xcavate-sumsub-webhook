@@ -206,8 +206,12 @@ SUMSUB_SECRET=<the secret key you copied in Step 3>
 ### Step 5 — Test it
 
 1. In the Webhook manager, use **Test webhook** to send a sample event — it
-   should return `200`. (Sumsub considers no response within 5s a timeout and
-   retries up to 4 times.)
+   should return `200`. The service acknowledges immediately and processes
+   the event in the background (the on-chain transaction alone takes longer
+   than Sumsub's ~5s webhook timeout) — watch the service logs for the
+   outcome. Sumsub resends events whose delivery times out; identical
+   redeliveries are deduped for 15 minutes, so a retried delivery is not
+   processed twice.
 2. Run a real verification in **Sandbox** mode with `externalUserId` set to a
    test wallet, approve the applicant, and confirm in the logs that the role was
    assigned. Every successful call logs a `signature` you can open in the
@@ -287,8 +291,10 @@ Notes:
   transfer, an idempotent creation of the user's tGBP token account, and the
   tGBP transfer. If it fails (admin out of tGBP, RPC hiccup, …) it is logged
   and dropped — the role change is unaffected and Sumsub's 200 ack is sent.
-  Note the consequence: a re-delivered or re-reviewed approval webhook
-  airdrops again.
+  Note that Sumsub resends an event when the webhook call times out, but
+  identical redeliveries (same `applicantId` + `inspectionId`) are deduped
+  for 15 minutes, so a retry does not airdrop twice; a genuinely new review
+  of the same applicant (a fresh `inspectionId`) pays out again.
 - **Off-chain customer registration (best-effort).** Once the on-chain half
   has confirmed, the service mints a Sumsub [Reusable KYC share
   token](https://docs.sumsub.com/docs/reusable-kyc-via-api) for the applicant
@@ -302,6 +308,19 @@ Notes:
   created with the **"Share applicants data"** permission checked (Reusable
   Identity group), otherwise the share-token call fails with
   `403 "User not authorized"` — see [Troubleshooting](#troubleshooting).
+  Prerequisites on the tgbp.io side: the client account behind
+  `TGBP_API_KEY` must have Sumsub sharing enabled — a one-time
+  `PATCH /api/v1/clients/me` with `{"sumsub_sharing_enabled": true}`, done
+  for you by [`scripts/enable-sumsub-sharing.sh`](scripts/enable-sumsub-sharing.sh)
+  (without it every registration fails with `400 sumsub_sharing_not_enabled`).
+  The share token's `forClientId` is tgbp.io's Sumsub client id, documented
+  as `tgbp.io` in the tGBP API reference. Share tokens are single-use, so a
+  fresh one is minted per registration attempt. The applicant needs an email
+  and a name on its Sumsub record — the tgbp.io create body requires them,
+  so without them the step is skipped and the log says why. Note the
+  customer stays `pending` after registration: the imported KYC result is
+  recorded as evidence and tgbp.io runs a check in its own Sumsub account
+  before verifying the customer.
   If it fails it is logged and dropped — the on-chain role is unaffected and
   the webhook still acks 200. The step is skipped entirely unless
   `TGBP_API_KEY`, `SUMSUB_APP_TOKEN`, `SUMSUB_APP_TOKEN_SECRET` and
@@ -452,3 +471,7 @@ solana program show 7TrzjKpdrEhnfhxuw8tWdH1sjxadazscsG5HXCDPLmaY --url devnet
 | `WrongRentPayer` (6005) | `remove_role` was sent with a `rent_payer` other than the one stored on the role account |
 | Nothing happens on approval | The webhook isn't subscribed to `applicantReviewed`, or the target URL isn't reachable over HTTPS |
 | `Sumsub share token request failed (403 "User not authorized")` | The `SUMSUB_APP_TOKEN` role lacks the **"Share applicants data"** permission (Reusable Identity group) — the token authenticates (the applicant-details call works) but isn't allowed to mint share tokens. [App token permissions are fixed at creation](https://docs.sumsub.com/docs/app-tokens) and cannot be edited: generate a **new** app token (same mode as your KYC flow — sandbox/production) with that permission checked, update the `SUMSUB_APP_TOKEN` / `SUMSUB_APP_TOKEN_SECRET` secrets and redeploy. Also verify the donor↔tgbp.io partner connection exists in the same environment (Sumsub Dashboard → Reusable identity → Partners) |
+| `tgbp.io customer registration failed (400 sumsub_sharing_not_enabled)` | The tgbp.io client account hasn't enabled Sumsub applicant sharing — run `scripts/enable-sumsub-sharing.sh` once with the same `TGBP_API_KEY`, then retrigger the review |
+| `tgbp.io customer registration failed (401)` | `TGBP_API_KEY` is wrong, rotated, or for the wrong environment (`tgbp_sandbox_…` vs `tgbp_live_…`) |
+| `tgbp.io registration skipped — the Sumsub applicant has no email address` / `has no name on record` | The tgbp.io create body requires an email and a name — add them to the Sumsub applicant, or register the customer manually in the tgbp.io portal |
+| `Duplicate webhook delivery` in the logs | Normal — Sumsub resent an event that was already processed or is still in flight; the duplicate was skipped and no second airdrop/registration happened |

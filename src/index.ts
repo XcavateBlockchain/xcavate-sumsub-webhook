@@ -843,6 +843,13 @@ async function fetchSumsubApplicantDetails(
  * `name` or both `first_name` and `last_name`, and the snake_case
  * `sumsub_share_token` lets tgbp.io pull the KYC data from Sumsub itself.
  * There is no wallet field.
+ *
+ * Success is a 201 with the customer in a `data` envelope
+ * (`{ "data": { "id": "customer_…", "status": "pending", … } }`). The share
+ * token import is fire-and-forget on tgbp.io's side: the imported result is
+ * recorded as evidence and the customer stays `pending` until a check runs
+ * in tgbp.io's own Sumsub account (a shared rejection marks the customer
+ * `rejected` on sight).
  */
 async function registerTgbpCustomer(
   details: { email: string; firstName?: string; lastName?: string },
@@ -873,19 +880,68 @@ async function registerTgbpCustomer(
 
   const text = await res.text();
   if (!res.ok) {
+    // 400s carry the reason in the body — a machine-readable code like
+    // `sumsub_sharing_not_enabled`, and/or `details.field_errors` naming the
+    // offending fields.
+    let fieldErrors = "";
+    try {
+      const parsed = JSON.parse(text) as {
+        details?: { field_errors?: unknown };
+      };
+      if (parsed.details?.field_errors) {
+        fieldErrors = ` — field_errors: ${JSON.stringify(parsed.details.field_errors)}`;
+      }
+    } catch {
+      // Non-JSON error body — the raw slice below is all we have.
+    }
+
+    if (res.status === 400 && text.includes("sumsub_sharing_not_enabled")) {
+      throw new Error(
+        "tgbp.io customer registration failed (400 sumsub_sharing_not_enabled): " +
+          "the client account behind TGBP_API_KEY has not enabled Sumsub " +
+          "applicant sharing. Run scripts/enable-sumsub-sharing.sh once with " +
+          "the same API key (it PATCHes /api/v1/clients/me with " +
+          '{"sumsub_sharing_enabled": true}).',
+      );
+    }
+    if (res.status === 401) {
+      throw new Error(
+        "tgbp.io customer registration failed (401): TGBP_API_KEY is missing, " +
+          "wrong, or expired (sandbox keys are prefixed tgbp_sandbox_). " +
+          `Response: ${text.slice(0, 300)}`,
+      );
+    }
+    if (res.status === 429) {
+      const retryAfter = res.headers.get("x-rate-limit-retry-after");
+      throw new Error(
+        "tgbp.io customer registration failed (429 rate limited)" +
+          (retryAfter ? ` — retry after ${retryAfter}s` : "") +
+          ". The next applicant event for this user retries the registration.",
+      );
+    }
     throw new Error(
-      `tgbp.io customer registration failed (${res.status}): ${text.slice(0, 500)}`,
+      `tgbp.io customer registration failed (${res.status}): ${text.slice(0, 500)}${fieldErrors}`,
     );
   }
 
   let customerId: string | null = null;
+  let customerStatus: string | null = null;
   try {
-    const parsed = JSON.parse(text) as { id?: unknown };
-    if (typeof parsed.id === "string") customerId = parsed.id;
+    const parsed = JSON.parse(text) as {
+      data?: { id?: unknown; status?: unknown };
+      id?: unknown;
+      status?: unknown;
+    };
+    const customer = parsed.data ?? parsed;
+    if (typeof customer.id === "string") customerId = customer.id;
+    if (typeof customer.status === "string") customerStatus = customer.status;
   } catch {
     // Non-JSON success body — the 2xx status is all we need.
   }
-  logger.info({ customerId }, "Customer registered on tgbp.io");
+  logger.info(
+    { customerId, customerStatus },
+    "Customer registered on tgbp.io",
+  );
 }
 
 /**
@@ -904,8 +960,8 @@ async function registerTgbpCustomerBestEffort(
   if (!TGBP_REGISTRATION_ENABLED) {
     logger.debug(
       { wallet: user.toBase58() },
-      "tgbp.io registration skipped — TGBP_API_KEY, SUMSUB_APP_TOKEN or " +
-        "SUMSUB_RECIPIENT_CLIENT_ID is not set",
+      "tgbp.io registration skipped — TGBP_API_KEY, SUMSUB_APP_TOKEN, " +
+        "SUMSUB_APP_TOKEN_SECRET or SUMSUB_RECIPIENT_CLIENT_ID is not set",
     );
     return;
   }
@@ -928,6 +984,15 @@ async function registerTgbpCustomerBestEffort(
       );
       return;
     }
+    // tgbp.io requires a `name` or a `first_name`/`last_name` pair — without
+    // any name on the Sumsub record the create call can only fail with a 400.
+    if (!details.firstName && !details.lastName) {
+      logger.warn(
+        { wallet: user.toBase58(), applicantId },
+        "tgbp.io registration skipped — the Sumsub applicant has no name on record",
+      );
+      return;
+    }
     const shareToken = await fetchSumsubShareToken(applicantId);
     await registerTgbpCustomer(
       { email, firstName: details.firstName, lastName: details.lastName },
@@ -947,7 +1012,14 @@ async function registerTgbpCustomerBestEffort(
 
 // ── Webhook processing ──────────────────────────────────────────────────
 
-async function processSumsubWebhook(body: SumsubPayload): Promise<void> {
+/**
+ * Process one verified Sumsub event. Returns true when the event was fully
+ * handled (including "acknowledged, nothing to do") and false when the
+ * on-chain application of the result failed — the dedupe wrapper uses that
+ * to decide whether Sumsub's redelivery of the same event should run again.
+ * Never throws: failures are logged here.
+ */
+async function processSumsubWebhook(body: SumsubPayload): Promise<boolean> {
   const eventType = body.type ?? "";
   const levelName = body.levelName ?? "";
   const reviewAnswer = body.reviewResult?.reviewAnswer;
@@ -963,13 +1035,13 @@ async function processSumsubWebhook(body: SumsubPayload): Promise<void> {
   // retrying.
   if (eventType !== "applicantReviewed") {
     logger.info({ eventType }, "Non-decision event, acknowledging without action");
-    return;
+    return true;
   }
 
   // reviewResult.reviewAnswer === "GREEN" → approved, anything else → rejected.
   if (reviewAnswer === undefined) {
     logger.warn({ caseId }, "applicantReviewed without reviewResult, skipping");
-    return;
+    return true;
   }
   const isApproved = reviewAnswer === "GREEN";
 
@@ -981,7 +1053,7 @@ async function processSumsubWebhook(body: SumsubPayload): Promise<void> {
   const accountAddress = body.externalUserId;
   if (!accountAddress) {
     logger.warn({ caseId }, "No externalUserId in payload, skipping");
-    return;
+    return true;
   }
 
   // Validate the address up front so we never send a transaction that can
@@ -994,7 +1066,7 @@ async function processSumsubWebhook(body: SumsubPayload): Promise<void> {
       { caseId, accountAddress },
       "Wallet address is not a valid Solana public key, skipping",
     );
-    return;
+    return true;
   }
 
   try {
@@ -1011,11 +1083,13 @@ async function processSumsubWebhook(body: SumsubPayload): Promise<void> {
     } else {
       await handleRejected(user, role, roleName);
     }
+    return true;
   } catch (err) {
     logger.error(
       { err: describeError(err), user: user.toBase58(), role: roleName },
       "Failed to apply KYC result on-chain",
     );
+    return false;
   }
 }
 
@@ -1221,26 +1295,80 @@ function verifySumsubSignature(req: Request): boolean {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
-// ── Sumsub webhook endpoint ────────────────────────────────────────────
-app.post("/webhook/sumsub", async (req: Request, res: Response) => {
-  try {
-    // Verify the HMAC signature when a secret is configured. Without this an
-    // attacker who learns the URL could forge an "approved" event and get
-    // themselves whitelisted, so it is strongly recommended in production.
-    if (SUMSUB_SECRET) {
-      if (!verifySumsubSignature(req)) {
-        logger.warn("Invalid or missing Sumsub webhook signature");
-        return res.status(401).json({ error: "Invalid signature" });
-      }
-    }
+// ── Delivery dedupe ──────────────────────────────────────────────────────
+// Sumsub considers a webhook call failed when there is no response within
+// ~5 seconds and then resends the same event (resend-failed-webhooks, up to
+// 4 attempts). Full processing — a confirmed Solana transaction, the
+// airdrop, then the Sumsub/tgbp.io calls — routinely takes longer than
+// that, so the same event arrives again while the first attempt is still
+// running or right after it succeeded. Without a guard every redelivery
+// pays the airdrop out again and burns a single-use share token on a
+// duplicate customer create.
+//
+// Deliveries are keyed on the event identity: a Sumsub retry resends the
+// same applicantId + inspectionId, while a genuinely new review gets a
+// fresh inspectionId and is processed (and pays out) again. A key is held
+// while its delivery is in flight and for a TTL after success; a FAILED
+// attempt drops the key so Sumsub's retry can do its job.
+const DELIVERY_DEDUPE_TTL_MS = 15 * 60 * 1000;
+const recentDeliveries = new Map<string, number>();
 
-    const body = req.body as SumsubPayload;
-    await processSumsubWebhook(body);
-    res.status(200).json({ status: "ok" });
-  } catch (err) {
-    logger.error(err, "Error processing webhook");
-    res.status(500).json({ error: "Internal server error" });
+function deliveryKey(body: SumsubPayload): string | null {
+  if (!body.type || !body.applicantId) return null;
+  return `${body.type}:${body.applicantId}:${body.inspectionId ?? ""}`;
+}
+
+function processDeliveryDeduped(body: SumsubPayload): void {
+  const key = deliveryKey(body);
+  const now = Date.now();
+
+  if (key) {
+    const seenUntil = recentDeliveries.get(key);
+    if (seenUntil !== undefined && seenUntil > now) {
+      logger.info(
+        { eventType: body.type, caseId: body.applicantId },
+        "Duplicate webhook delivery — already processed or in flight, skipping",
+      );
+      return;
+    }
+    recentDeliveries.set(key, now + DELIVERY_DEDUPE_TTL_MS);
+    // Lazy sweep so the map cannot grow unbounded.
+    for (const [k, until] of recentDeliveries) {
+      if (until <= now) recentDeliveries.delete(k);
+    }
   }
+
+  void (async () => {
+    try {
+      const processed = await processSumsubWebhook(body);
+      // Failed to apply on-chain — forget the delivery so Sumsub's retry is
+      // processed instead of deduped away.
+      if (!processed && key) recentDeliveries.delete(key);
+    } catch (err) {
+      if (key) recentDeliveries.delete(key);
+      logger.error(err, "Error processing webhook");
+    }
+  })();
+}
+
+// ── Sumsub webhook endpoint ────────────────────────────────────────────
+app.post("/webhook/sumsub", (req: Request, res: Response) => {
+  // Verify the HMAC signature when a secret is configured. Without this an
+  // attacker who learns the URL could forge an "approved" event and get
+  // themselves whitelisted, so it is strongly recommended in production.
+  if (SUMSUB_SECRET) {
+    if (!verifySumsubSignature(req)) {
+      logger.warn("Invalid or missing Sumsub webhook signature");
+      return res.status(401).json({ error: "Invalid signature" });
+    }
+  }
+
+  // Acknowledge immediately and process in the background: the full pipeline
+  // takes far longer than Sumsub's ~5s timeout, so answering only after
+  // processing makes Sumsub retry deliveries that actually succeeded.
+  // Redeliveries are deduped by processDeliveryDeduped.
+  processDeliveryDeduped((req.body ?? {}) as SumsubPayload);
+  res.status(200).json({ status: "ok" });
 });
 
 // ── Health check ───────────────────────────────────────────────────────

@@ -209,9 +209,9 @@ SUMSUB_SECRET=<the secret key you copied in Step 3>
    should return `200`. The service acknowledges immediately and processes
    the event in the background (the on-chain transaction alone takes longer
    than Sumsub's ~5s webhook timeout) — watch the service logs for the
-   outcome. Sumsub resends events whose delivery times out; identical
-   redeliveries are deduped for 15 minutes, so a retried delivery is not
-   processed twice.
+   outcome. Sumsub resends events whose delivery times out; duplicate
+   deliveries are processed again, so a retried delivery runs the full
+   pipeline a second time.
 2. Run a real verification in **Sandbox** mode with `externalUserId` set to a
    test wallet, approve the applicant, and confirm in the logs that the role was
    assigned. Every successful call logs a `signature` you can open in the
@@ -291,10 +291,12 @@ Notes:
   transfer, an idempotent creation of the user's tGBP token account, and the
   tGBP transfer. If it fails (admin out of tGBP, RPC hiccup, …) it is logged
   and dropped — the role change is unaffected and Sumsub's 200 ack is sent.
-  Note that Sumsub resends an event when the webhook call times out, but
-  identical redeliveries (same `applicantId` + `inspectionId`) are deduped
-  for 15 minutes, so a retry does not airdrop twice; a genuinely new review
-  of the same applicant (a fresh `inspectionId`) pays out again.
+  Note that Sumsub resends an event when the webhook call times out, and
+  duplicate deliveries are processed again: an identical redelivery (same
+  `applicantId` + `inspectionId`) pays the airdrop out a second time and
+  reruns the tgbp.io registration. Only the on-chain role change itself is
+  idempotent (read-before-write), so a redelivery while the first attempt
+  is still in flight can also send two concurrent airdrops.
 - **Off-chain customer registration (best-effort).** Once the on-chain half
   has confirmed, the service mints a Sumsub [Reusable KYC share
   token](https://docs.sumsub.com/docs/reusable-kyc-via-api) for the applicant
@@ -474,4 +476,4 @@ solana program show 7TrzjKpdrEhnfhxuw8tWdH1sjxadazscsG5HXCDPLmaY --url devnet
 | `tgbp.io customer registration failed (400 sumsub_sharing_not_enabled)` | The tgbp.io client account hasn't enabled Sumsub applicant sharing — run `scripts/enable-sumsub-sharing.sh` once with the same `TGBP_API_KEY`, then retrigger the review |
 | `tgbp.io customer registration failed (401)` | `TGBP_API_KEY` is wrong, rotated, or for the wrong environment (`tgbp_sandbox_…` vs `tgbp_live_…`) |
 | `tgbp.io registration skipped — the Sumsub applicant has no email address` / `has no name on record` | The tgbp.io create body requires an email and a name — add them to the Sumsub applicant, or register the customer manually in the tgbp.io portal |
-| `Duplicate webhook delivery` in the logs | Normal — Sumsub resent an event that was already processed or is still in flight; the duplicate was skipped and no second airdrop/registration happened |
+| A user was airdropped (or registered on tgbp.io) twice | Sumsub redelivered the event (delivery timeout or manual resend) and duplicate deliveries are processed again — expected; only the on-chain role change is idempotent |

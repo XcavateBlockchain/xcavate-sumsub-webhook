@@ -894,7 +894,7 @@ async function registerTgbpCustomer(
     } catch {
       // Non-JSON error body — the raw slice below is all we have.
     }
-
+ 
     if (res.status === 400 && text.includes("sumsub_sharing_not_enabled")) {
       throw new Error(
         "tgbp.io customer registration failed (400 sumsub_sharing_not_enabled): " +
@@ -1015,9 +1015,9 @@ async function registerTgbpCustomerBestEffort(
 /**
  * Process one verified Sumsub event. Returns true when the event was fully
  * handled (including "acknowledged, nothing to do") and false when the
- * on-chain application of the result failed — the dedupe wrapper uses that
- * to decide whether Sumsub's redelivery of the same event should run again.
- * Never throws: failures are logged here.
+ * on-chain application of the result failed — Sumsub's redelivery of the
+ * same event then gets to run it again. Never throws: failures are logged
+ * here.
  */
 async function processSumsubWebhook(body: SumsubPayload): Promise<boolean> {
   const eventType = body.type ?? "";
@@ -1295,62 +1295,6 @@ function verifySumsubSignature(req: Request): boolean {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
-// ── Delivery dedupe ──────────────────────────────────────────────────────
-// Sumsub considers a webhook call failed when there is no response within
-// ~5 seconds and then resends the same event (resend-failed-webhooks, up to
-// 4 attempts). Full processing — a confirmed Solana transaction, the
-// airdrop, then the Sumsub/tgbp.io calls — routinely takes longer than
-// that, so the same event arrives again while the first attempt is still
-// running or right after it succeeded. Without a guard every redelivery
-// pays the airdrop out again and burns a single-use share token on a
-// duplicate customer create.
-//
-// Deliveries are keyed on the event identity: a Sumsub retry resends the
-// same applicantId + inspectionId, while a genuinely new review gets a
-// fresh inspectionId and is processed (and pays out) again. A key is held
-// while its delivery is in flight and for a TTL after success; a FAILED
-// attempt drops the key so Sumsub's retry can do its job.
-const DELIVERY_DEDUPE_TTL_MS = 15 * 60 * 1000;
-const recentDeliveries = new Map<string, number>();
-
-function deliveryKey(body: SumsubPayload): string | null {
-  if (!body.type || !body.applicantId) return null;
-  return `${body.type}:${body.applicantId}:${body.inspectionId ?? ""}`;
-}
-
-function processDeliveryDeduped(body: SumsubPayload): void {
-  const key = deliveryKey(body);
-  const now = Date.now();
-
-  if (key) {
-    const seenUntil = recentDeliveries.get(key);
-    if (seenUntil !== undefined && seenUntil > now) {
-      logger.info(
-        { eventType: body.type, caseId: body.applicantId },
-        "Duplicate webhook delivery — already processed or in flight, skipping",
-      );
-      return;
-    }
-    recentDeliveries.set(key, now + DELIVERY_DEDUPE_TTL_MS);
-    // Lazy sweep so the map cannot grow unbounded.
-    for (const [k, until] of recentDeliveries) {
-      if (until <= now) recentDeliveries.delete(k);
-    }
-  }
-
-  void (async () => {
-    try {
-      const processed = await processSumsubWebhook(body);
-      // Failed to apply on-chain — forget the delivery so Sumsub's retry is
-      // processed instead of deduped away.
-      if (!processed && key) recentDeliveries.delete(key);
-    } catch (err) {
-      if (key) recentDeliveries.delete(key);
-      logger.error(err, "Error processing webhook");
-    }
-  })();
-}
-
 // ── Sumsub webhook endpoint ────────────────────────────────────────────
 app.post("/webhook/sumsub", (req: Request, res: Response) => {
   // Verify the HMAC signature when a secret is configured. Without this an
@@ -1366,8 +1310,13 @@ app.post("/webhook/sumsub", (req: Request, res: Response) => {
   // Acknowledge immediately and process in the background: the full pipeline
   // takes far longer than Sumsub's ~5s timeout, so answering only after
   // processing makes Sumsub retry deliveries that actually succeeded.
-  // Redeliveries are deduped by processDeliveryDeduped.
-  processDeliveryDeduped((req.body ?? {}) as SumsubPayload);
+  // Duplicate deliveries are allowed: every redelivery runs the full
+  // pipeline again — the on-chain role change is idempotent by
+  // read-before-write, but the airdrop pays out and the tgbp.io
+  // registration runs once per delivery.
+  void processSumsubWebhook((req.body ?? {}) as SumsubPayload).catch((err) =>
+    logger.error(err, "Error processing webhook"),
+  );
   res.status(200).json({ status: "ok" });
 });
 

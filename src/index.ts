@@ -941,6 +941,14 @@ async function fetchSumsubApplicantDetails(
  * `sumsub_share_token` lets tgbp.io pull the KYC data from Sumsub itself.
  * There is no wallet field.
  *
+ * `metadata.sumsub_applicant_id` records OUR (donor-side) Sumsub applicant
+ * id on the customer: the onramp webview resolves a user to their tgbp.io
+ * customer by exactly this field, and the share-token import is not
+ * guaranteed to write the donor applicant id itself (the applicant created
+ * in tgbp.io's own Sumsub account gets a different id). If the API rejects
+ * the `metadata` field with a 400, the create is retried without it — the
+ * registration must not fail over a field the API reference does not list.
+ *
  * Success is a 201 with the customer in a `data` envelope
  * (`{ "data": { "id": "customer_…", "status": "pending", … } }`). The share
  * token import is fire-and-forget on tgbp.io's side: the imported result is
@@ -948,14 +956,29 @@ async function fetchSumsubApplicantDetails(
  * in tgbp.io's own Sumsub account (a shared rejection marks the customer
  * `rejected` on sight).
  */
+async function postTgbpCustomer(body: Record<string, unknown>) {
+  const res = await fetch(`${TGBP_API_BASE_URL}${TGBP_CUSTOMERS_PATH}`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": TGBP_API_KEY,
+    },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(30_000),
+  });
+  return { res, text: await res.text() };
+}
+
 async function registerTgbpCustomer(
   details: ApplicantDetails & { email: string },
   shareToken: string,
+  applicantId: string,
 ): Promise<void> {
-  const body: Record<string, string> = {
+  const body: Record<string, unknown> = {
     type: "individual",
     email: details.email,
     sumsub_share_token: shareToken,
+    metadata: { sumsub_applicant_id: applicantId },
   };
   if (details.firstName && details.lastName) {
     body.first_name = details.firstName;
@@ -982,17 +1005,23 @@ async function registerTgbpCustomer(
     }
   }
 
-  const res = await fetch(`${TGBP_API_BASE_URL}${TGBP_CUSTOMERS_PATH}`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-api-key": TGBP_API_KEY,
-    },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(30_000),
-  });
+  let { res, text } = await postTgbpCustomer(body);
+  // The API reference does not list `metadata` on the create body: if the
+  // server validates strictly and rejects it, register without it rather
+  // than not at all. The onramp's Sumsub-id lookup then has to rely on
+  // whatever the share-token import recorded — which is exactly the case
+  // that made registrations unfindable, so say so loudly.
+  if (res.status === 400 && text.includes("metadata")) {
+    logger.warn(
+      { applicantId },
+      "tgbp.io rejected the customer `metadata` field (400) — retrying the " +
+        "registration without it. The onramp may not be able to resolve " +
+        "this customer by Sumsub applicant id.",
+    );
+    delete body.metadata;
+    ({ res, text } = await postTgbpCustomer(body));
+  }
 
-  const text = await res.text();
   if (!res.ok) {
     // 400s carry the reason in the body — a machine-readable code like
     // `sumsub_sharing_not_enabled`, and/or `details.field_errors` naming the
@@ -1056,6 +1085,8 @@ async function registerTgbpCustomer(
     {
       customerId,
       customerStatus,
+      applicantId,
+      withMetadata: body.metadata !== undefined,
       idDocs: details.idDocCount,
       docType: details.idDoc?.type,
     },
@@ -1125,7 +1156,7 @@ async function registerTgbpCustomerBestEffort(
       );
     }
     const shareToken = await fetchSumsubShareToken(applicantId);
-    await registerTgbpCustomer({ ...details, email }, shareToken);
+    await registerTgbpCustomer({ ...details, email }, shareToken, applicantId);
   } catch (err) {
     logger.error(
       {

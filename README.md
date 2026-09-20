@@ -323,6 +323,18 @@ Notes:
   customer stays `pending` after registration: the imported KYC result is
   recorded as evidence and tgbp.io runs a check in its own Sumsub account
   before verifying the customer.
+  **Documents.** The share token imports the document IMAGES and check
+  results, but only for verification steps that overlap between your Sumsub
+  level and tgbp.io's level — Sumsub scopes the transfer at ingestion time,
+  so if their level has no matching ID-document step (or rejects the doc
+  type/country/capture settings), only profile data crosses and their
+  applicant lands in "Documents requested". The customer record's own
+  document FIELDS (`document_type`, `document_number`,
+  `document_expiration_date`, `date_of_birth`, `phone`) are never imported,
+  so the service mirrors them onto the create body from the applicant's
+  verified Sumsub data. If the applicant has no documents on record at all,
+  the registration still runs but the log warns loudly — profile data is
+  all a share token can transfer in that case.
   If it fails it is logged and dropped — the on-chain role is unaffected and
   the webhook still acks 200. The step is skipped entirely unless
   `TGBP_API_KEY`, `SUMSUB_APP_TOKEN`, `SUMSUB_APP_TOKEN_SECRET` and

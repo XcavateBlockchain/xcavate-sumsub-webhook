@@ -794,16 +794,69 @@ interface ApplicantDetails {
   email?: string;
   firstName?: string;
   lastName?: string;
+  dob?: string;
+  phone?: string;
+  /** Primary identity document, mapped onto the tgbp.io document fields. */
+  idDoc?: {
+    type?: string;
+    number?: string;
+    issuingCountryAlpha2?: string;
+    validUntil?: string;
+  };
+  /** How many ID documents the applicant has on record (0 = nothing to share). */
+  idDocCount: number;
 }
 
 /**
- * Fetch the applicant's contact details from the Sumsub Resource API. The
- * `applicantReviewed` webhook payload doesn't carry them, and the tgbp.io
- * create body needs an email (plus a name) on top of the share token.
+ * Sumsub document types → tgbp.io `document_type` enum
+ * (`passport`, `driving_license`, `national_id`, `other`).
+ */
+const TGBP_DOC_TYPE_BY_SUMSUB: Record<string, string> = {
+  PASSPORT: "passport",
+  DRIVERS: "driving_license",
+  ID_CARD: "national_id",
+};
+
+/**
+ * Sumsub reports countries as ISO 3166-1 alpha-3; tgbp.io wants alpha-2.
+ * Covers the common issuing countries — an unmapped code omits the optional
+ * field rather than risking a 400 by sending a wrong-format value.
+ */
+const ALPHA3_TO_ALPHA2: Record<string, string> = {
+  GBR: "GB", USA: "US", IRL: "IE", FRA: "FR", DEU: "DE", ESP: "ES",
+  ITA: "IT", PRT: "PT", NLD: "NL", BEL: "BE", LUX: "LU", CHE: "CH",
+  AUT: "AT", POL: "PL", CZE: "CZ", SVK: "SK", HUN: "HU", ROU: "RO",
+  BGR: "BG", GRC: "GR", HRV: "HR", SVN: "SI", EST: "EE", LVA: "LV",
+  LTU: "LT", FIN: "FI", SWE: "SE", NOR: "NO", DNK: "DK", ISL: "IS",
+  MLT: "MT", CYP: "CY", UKR: "UA", TUR: "TR", ARE: "AE", SAU: "SA",
+  QAT: "QA", ISR: "IL", IND: "IN", PAK: "PK", CHN: "CN", HKG: "HK",
+  SGP: "SG", JPN: "JP", KOR: "KR", TWN: "TW", THA: "TH", MYS: "MY",
+  IDN: "ID", PHL: "PH", VNM: "VN", AUS: "AU", NZL: "NZ", CAN: "CA",
+  MEX: "MX", BRA: "BR", ARG: "AR", COL: "CO", PER: "PE", CHL: "CL",
+  ZAF: "ZA", NGA: "NG", KEN: "KE", GHA: "GH", EGY: "EG", MAR: "MA",
+  JEY: "JE", GGY: "GG", IMN: "IM", GIB: "GI", MCO: "MC", LIE: "LI",
+  ALB: "AL", SRB: "RS", MNE: "ME", BIH: "BA", MKD: "MK", GEO: "GE",
+  ARM: "AM", AZE: "AZ", KAZ: "KZ", UZB: "UZ", LKA: "LK", BGD: "BD",
+  PAN: "PA", CRI: "CR", DOM: "DO", CYM: "KY", VGB: "VG", BMU: "BM",
+};
+
+function toAlpha2(country: string | undefined): string | undefined {
+  if (!country) return undefined;
+  if (/^[A-Z]{2}$/.test(country)) return country;
+  return ALPHA3_TO_ALPHA2[country.toUpperCase()];
+}
+
+/**
+ * Fetch the applicant's contact and document details from the Sumsub Resource
+ * API. The `applicantReviewed` webhook payload doesn't carry them, and the
+ * tgbp.io create body needs an email (plus a name) on top of the share token.
  * Endpoint: `GET /resources/applicants/{id}/one`, authenticated with the
  * signed header scheme (see `sumsubFetch`). In the response the email sits
  * at the root level while the names are nested under `fixedInfo` (`info`
- * as fallback).
+ * as fallback). The verified document list lives at `info.idDocs` — per the
+ * tgbp.io API reference, document metadata (type, number, expiry, …) is NOT
+ * imported by the share token and "should still be sent as normal fields",
+ * so it is extracted here too; the document IMAGES cross via the token.
  */
 async function fetchSumsubApplicantDetails(
   applicantId: string,
@@ -818,10 +871,29 @@ async function fetchSumsubApplicantDetails(
     );
   }
 
+  interface SumsubIdDoc {
+    idDocType?: unknown;
+    number?: unknown;
+    country?: unknown;
+    validUntil?: unknown;
+  }
   const data = JSON.parse(text) as {
     email?: unknown;
-    fixedInfo?: Record<string, unknown>;
-    info?: Record<string, unknown>;
+    phone?: unknown;
+    fixedInfo?: {
+      firstName?: unknown;
+      lastName?: unknown;
+      dob?: unknown;
+      phone?: unknown;
+      idDocs?: unknown;
+    };
+    info?: {
+      firstName?: unknown;
+      lastName?: unknown;
+      dob?: unknown;
+      phone?: unknown;
+      idDocs?: unknown;
+    };
   };
   const pick = (...values: unknown[]): string | undefined => {
     for (const value of values) {
@@ -829,10 +901,35 @@ async function fetchSumsubApplicantDetails(
     }
     return undefined;
   };
+
+  // `info` holds the verified results (from the documents), `fixedInfo` the
+  // applicant-supplied input — prefer verified data for dob and documents.
+  const idDocs = (
+    Array.isArray(data.info?.idDocs) && data.info.idDocs.length > 0
+      ? data.info.idDocs
+      : Array.isArray(data.fixedInfo?.idDocs)
+        ? data.fixedInfo.idDocs
+        : []
+  ) as SumsubIdDoc[];
+  // The customer record takes one document — prefer the passport.
+  const primary =
+    idDocs.find((d) => d.idDocType === "PASSPORT") ?? idDocs[0];
+
   return {
     email: pick(data.email),
     firstName: pick(data.fixedInfo?.firstName, data.info?.firstName),
     lastName: pick(data.fixedInfo?.lastName, data.info?.lastName),
+    dob: pick(data.info?.dob, data.fixedInfo?.dob),
+    phone: pick(data.phone, data.info?.phone, data.fixedInfo?.phone),
+    idDoc: primary
+      ? {
+          type: TGBP_DOC_TYPE_BY_SUMSUB[pick(primary.idDocType) ?? ""] ?? "other",
+          number: pick(primary.number),
+          issuingCountryAlpha2: toAlpha2(pick(primary.country)),
+          validUntil: pick(primary.validUntil),
+        }
+      : undefined,
+    idDocCount: idDocs.length,
   };
 }
 
@@ -852,7 +949,7 @@ async function fetchSumsubApplicantDetails(
  * `rejected` on sight).
  */
 async function registerTgbpCustomer(
-  details: { email: string; firstName?: string; lastName?: string },
+  details: ApplicantDetails & { email: string },
   shareToken: string,
 ): Promise<void> {
   const body: Record<string, string> = {
@@ -866,6 +963,23 @@ async function registerTgbpCustomer(
   } else {
     const single = details.firstName ?? details.lastName;
     if (single) body.name = single;
+  }
+  // The share token imports the document IMAGES and check results; the
+  // customer record's own metadata fields are NOT imported (same rule as
+  // the questionnaire fields the API reference calls out), so mirror them
+  // here — the recurring-mint dossier gate requires e.g.
+  // `document_expiration_date` on the customer row.
+  if (details.dob) body.date_of_birth = details.dob;
+  if (details.phone) body.phone = details.phone;
+  if (details.idDoc) {
+    if (details.idDoc.type) body.document_type = details.idDoc.type;
+    if (details.idDoc.number) body.document_number = details.idDoc.number;
+    if (details.idDoc.issuingCountryAlpha2) {
+      body.document_issuing_country = details.idDoc.issuingCountryAlpha2;
+    }
+    if (details.idDoc.validUntil) {
+      body.document_expiration_date = details.idDoc.validUntil;
+    }
   }
 
   const res = await fetch(`${TGBP_API_BASE_URL}${TGBP_CUSTOMERS_PATH}`, {
@@ -939,7 +1053,12 @@ async function registerTgbpCustomer(
     // Non-JSON success body — the 2xx status is all we need.
   }
   logger.info(
-    { customerId, customerStatus },
+    {
+      customerId,
+      customerStatus,
+      idDocs: details.idDocCount,
+      docType: details.idDoc?.type,
+    },
     "Customer registered on tgbp.io",
   );
 }
@@ -993,11 +1112,20 @@ async function registerTgbpCustomerBestEffort(
       );
       return;
     }
+    // Not fatal — registration still proceeds — but the most common reason
+    // tgbp.io "receives no documents": the donor applicant has none. Typical
+    // in sandbox, where applicants get approved without real uploads.
+    if (details.idDocCount === 0) {
+      logger.warn(
+        { wallet: user.toBase58(), applicantId },
+        "The Sumsub applicant has NO ID documents on record — the share " +
+          "token can only import profile data, no document images. Check " +
+          "that the verification level collects documents and that the " +
+          "applicant was approved with real uploads.",
+      );
+    }
     const shareToken = await fetchSumsubShareToken(applicantId);
-    await registerTgbpCustomer(
-      { email, firstName: details.firstName, lastName: details.lastName },
-      shareToken,
-    );
+    await registerTgbpCustomer({ ...details, email }, shareToken);
   } catch (err) {
     logger.error(
       {
